@@ -141,9 +141,11 @@ a.Start(ctx, func(ctx context.Context, msg alan.Message) {
 
 ### Notes on Request-Reply
 
-- Use context with timeout/deadline to control how long to wait for responses
-- `SendAndWaitReply` returns all responses received before the context is done
-- Partial responses are returned even if some peers don't respond (with `context.DeadlineExceeded` error)
+- **Smart peer tracking**: The library tracks which peers you're waiting for responses from
+- **Early return on disconnect**: If a peer disconnects (gracefully or via heartbeat timeout) while waiting, the library automatically adjusts:
+  - `SendAndWaitReply`: Removes the disconnected peer from expected responses and returns when all remaining peers have responded
+  - `SendToAndWaitReply`: Returns immediately with `ErrPeerDisconnected` if the target peer disconnects
+- **No infinite waits**: Because peer disconnects are detected via the membership protocol, requests won't wait forever for unresponsive peers
 - The request ID correlation is handled automatically by the library
 
 ## Configuration
@@ -276,6 +278,9 @@ type SendResult struct {
 // Callbacks
 type PeerHandler func(addr *net.UDPAddr)
 type MessageHandler func(ctx context.Context, msg Message)
+
+// Errors
+var ErrPeerDisconnected = errors.New("peer disconnected before responding")
 ```
 
 ## License

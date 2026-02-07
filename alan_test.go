@@ -1060,3 +1060,251 @@ func TestRequestResponseProtocol(t *testing.T) {
 		}
 	})
 }
+
+func TestSendToAndWaitReply_PeerDisconnects(t *testing.T) {
+	const testPort = 15010
+
+	a1, _ := New(Config{
+		DNSAddr:           "localhost",
+		BindAddr:          "127.0.0.1",
+		Port:              testPort,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:           "localhost",
+		BindAddr:          "127.0.0.2",
+		Port:              testPort,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a2 will NOT respond to requests - simulating a peer that receives but doesn't reply
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			// Intentionally not replying
+		})
+	}()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Add a2 as peer of a1
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+	a1.peers.add(a2Addr)
+
+	// Start request in background
+	resultChan := make(chan error, 1)
+	go func() {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer reqCancel()
+
+		_, err := a1.SendToAndWaitReply(reqCtx, a2Addr, []byte("request"))
+		resultChan <- err
+	}()
+
+	// Give request time to be sent
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop a2 to simulate peer leaving
+	a2.Stop()
+
+	// Wait for result
+	select {
+	case err := <-resultChan:
+		if err != ErrPeerDisconnected {
+			t.Errorf("expected ErrPeerDisconnected, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("test timed out waiting for peer disconnect error")
+	}
+
+	a1.Stop()
+}
+
+func TestSendAndWaitReply_PeerDisconnectsDuringRequest(t *testing.T) {
+	const testPort1 = 15011
+	const testPort2 = 15021
+	const testPort3 = 15031
+
+	a1, _ := New(Config{
+		DNSAddr:           "localhost",
+		BindAddr:          "127.0.0.1",
+		Port:              testPort1,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:           "localhost",
+		BindAddr:          "127.0.0.1",
+		Port:              testPort2,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	a3, _ := New(Config{
+		DNSAddr:           "localhost",
+		BindAddr:          "127.0.0.1",
+		Port:              testPort3,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a2 responds immediately
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			if msg.IsRequest() {
+				a2.Reply(msg, []byte("from-a2"))
+			}
+		})
+	}()
+
+	// a3 does NOT respond (will be stopped during request)
+	go func() {
+		a3.Start(ctx, func(ctx context.Context, msg Message) {
+			// Intentionally not replying
+		})
+	}()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+	<-a3.Ready()
+
+	// Add peers
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort2}
+	a3Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort3}
+	a1.peers.add(a2Addr)
+	a1.peers.add(a3Addr)
+
+	// Start request in background
+	type result struct {
+		replies []Reply
+		err     error
+	}
+	resultChan := make(chan result, 1)
+	go func() {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer reqCancel()
+
+		replies, err := a1.SendAndWaitReply(reqCtx, []byte("request"))
+		resultChan <- result{replies, err}
+	}()
+
+	// Give request time to be sent and a2 to respond
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop a3 to simulate peer leaving
+	a3.Stop()
+
+	// Wait for result - should return with partial results once a3 leaves
+	select {
+	case res := <-resultChan:
+		if res.err != nil {
+			t.Errorf("unexpected error: %v", res.err)
+		}
+		if len(res.replies) != 1 {
+			t.Fatalf("expected 1 reply, got %d", len(res.replies))
+		}
+		if !bytes.Equal(res.replies[0].Data, []byte("from-a2")) {
+			t.Errorf("unexpected reply data: %q", res.replies[0].Data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("test timed out - SendAndWaitReply should return early when peer disconnects")
+	}
+
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestSendAndWaitReply_AllPeersDisconnect(t *testing.T) {
+	const testPort1 = 15012
+	const testPort2 = 15022
+
+	a1, _ := New(Config{
+		DNSAddr:           "localhost",
+		BindAddr:          "127.0.0.1",
+		Port:              testPort1,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:           "localhost",
+		BindAddr:          "127.0.0.1",
+		Port:              testPort2,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a2 does NOT respond
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			// Intentionally not replying
+		})
+	}()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Add peer
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort2}
+	a1.peers.add(a2Addr)
+
+	// Start request in background
+	type result struct {
+		replies []Reply
+		err     error
+	}
+	resultChan := make(chan result, 1)
+	go func() {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer reqCancel()
+
+		replies, err := a1.SendAndWaitReply(reqCtx, []byte("request"))
+		resultChan <- result{replies, err}
+	}()
+
+	// Give request time to be sent
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop a2 to simulate all peers leaving
+	a2.Stop()
+
+	// Wait for result - should return with empty results once all peers leave
+	select {
+	case res := <-resultChan:
+		if res.err != nil {
+			t.Errorf("unexpected error: %v", res.err)
+		}
+		if len(res.replies) != 0 {
+			t.Errorf("expected 0 replies, got %d", len(res.replies))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("test timed out - SendAndWaitReply should return early when all peers disconnect")
+	}
+
+	a1.Stop()
+}

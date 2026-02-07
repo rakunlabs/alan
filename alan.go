@@ -28,6 +28,8 @@ var (
 	ErrAlreadyStarted = errors.New("alan is already started")
 	// ErrNotStarted is returned when operations are attempted before Start
 	ErrNotStarted = errors.New("alan is not started")
+	// ErrPeerDisconnected is returned when the target peer disconnects before responding
+	ErrPeerDisconnected = errors.New("peer disconnected before responding")
 )
 
 // Config holds all configuration for Alan
@@ -95,8 +97,12 @@ type Reply struct {
 
 // pendingRequest tracks an in-flight request waiting for responses
 type pendingRequest struct {
-	responseChan  chan Reply
-	expectedCount int
+	responseChan chan Reply
+	// waitingFor tracks which peers we're still waiting for responses from
+	waitingFor   map[string]struct{}
+	waitingForMu sync.Mutex
+	// peerLeftChan receives notifications when a peer we're waiting for disconnects
+	peerLeftChan chan *net.UDPAddr
 }
 
 // SendResult contains the result of sending to a single peer
@@ -366,7 +372,8 @@ func (a *Alan) SendTo(addr *net.UDPAddr, data []byte) (int, error) {
 
 // SendAndWaitReply broadcasts a request to all peers and waits for their responses.
 // It returns all replies received before the context is cancelled or deadline exceeded.
-// The context should have a deadline/timeout set to control how long to wait.
+// If peers disconnect while waiting, they are removed from the expected responses.
+// The method returns when all remaining peers have responded or the context is done.
 func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, error) {
 	a.mu.RLock()
 	if !a.running {
@@ -397,11 +404,18 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 		return nil, err
 	}
 
+	// Build waitingFor set
+	waitingFor := make(map[string]struct{}, len(peers))
+	for _, peer := range peers {
+		waitingFor[peer.String()] = struct{}{}
+	}
+
 	// Register pending request
 	reqKey := hex.EncodeToString(requestID)
 	pending := &pendingRequest{
-		responseChan:  make(chan Reply, len(peers)+10), // Buffer for all expected responses + safety margin
-		expectedCount: len(peers),
+		responseChan: make(chan Reply, len(peers)+10),
+		waitingFor:   waitingFor,
+		peerLeftChan: make(chan *net.UDPAddr, len(peers)+10),
 	}
 	a.pendingRequestsMu.Lock()
 	a.pendingRequests[reqKey] = pending
@@ -428,12 +442,34 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 	// Collect responses
 	replies := make([]Reply, 0, len(peers))
 	for {
+		// Check if we're done waiting for all peers
+		pending.waitingForMu.Lock()
+		remaining := len(pending.waitingFor)
+		pending.waitingForMu.Unlock()
+		if remaining == 0 {
+			return replies, nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return replies, ctx.Err()
 		case reply := <-pending.responseChan:
 			replies = append(replies, reply)
-			if len(replies) >= pending.expectedCount {
+			// Remove this peer from waitingFor
+			pending.waitingForMu.Lock()
+			delete(pending.waitingFor, reply.Addr.String())
+			remaining := len(pending.waitingFor)
+			pending.waitingForMu.Unlock()
+			if remaining == 0 {
+				return replies, nil
+			}
+		case leftAddr := <-pending.peerLeftChan:
+			// Peer disconnected, remove from waitingFor
+			pending.waitingForMu.Lock()
+			delete(pending.waitingFor, leftAddr.String())
+			remaining := len(pending.waitingFor)
+			pending.waitingForMu.Unlock()
+			if remaining == 0 {
 				return replies, nil
 			}
 		}
@@ -441,7 +477,7 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 }
 
 // SendToAndWaitReply sends a request to a specific peer and waits for its response.
-// The context should have a deadline/timeout set to control how long to wait.
+// Returns ErrPeerDisconnected if the target peer disconnects before responding.
 func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data []byte) (*Reply, error) {
 	a.mu.RLock()
 	if !a.running {
@@ -466,11 +502,16 @@ func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data [
 		return nil, err
 	}
 
+	// Build waitingFor set with single peer
+	waitingFor := make(map[string]struct{}, 1)
+	waitingFor[addr.String()] = struct{}{}
+
 	// Register pending request
 	reqKey := hex.EncodeToString(requestID)
 	pending := &pendingRequest{
-		responseChan:  make(chan Reply, 1),
-		expectedCount: 1,
+		responseChan: make(chan Reply, 1),
+		waitingFor:   waitingFor,
+		peerLeftChan: make(chan *net.UDPAddr, 1),
 	}
 	a.pendingRequestsMu.Lock()
 	a.pendingRequests[reqKey] = pending
@@ -494,6 +535,8 @@ func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data [
 		return nil, ctx.Err()
 	case reply := <-pending.responseChan:
 		return &reply, nil
+	case <-pending.peerLeftChan:
+		return nil, ErrPeerDisconnected
 	}
 }
 
@@ -523,6 +566,27 @@ func (a *Alan) Reply(msg Message, data []byte) (int, error) {
 	}
 
 	return conn.WriteToUDP(processed, msg.Addr)
+}
+
+// notifyPeerLeft notifies all pending requests that a peer has left.
+// This allows SendAndWaitReply and SendToAndWaitReply to return early
+// instead of waiting for responses that will never come.
+func (a *Alan) notifyPeerLeft(addr *net.UDPAddr) {
+	a.pendingRequestsMu.RLock()
+	defer a.pendingRequestsMu.RUnlock()
+
+	peerKey := addr.String()
+	for _, pending := range a.pendingRequests {
+		pending.waitingForMu.Lock()
+		if _, waiting := pending.waitingFor[peerKey]; waiting {
+			// Non-blocking send to peerLeftChan
+			select {
+			case pending.peerLeftChan <- addr:
+			default:
+			}
+		}
+		pending.waitingForMu.Unlock()
+	}
 }
 
 // Peers returns the list of current peer addresses
@@ -689,6 +753,9 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 		}
 		peerAddr := buildPeerAddr(sourceAddr, port)
 		if existed := a.peers.remove(peerAddr); existed {
+			// Notify pending requests that this peer left
+			a.notifyPeerLeft(peerAddr)
+
 			a.mu.RLock()
 			handler := a.onPeerLeave
 			a.mu.RUnlock()
@@ -824,6 +891,12 @@ func (a *Alan) heartbeatLoop() {
 
 			// Remove stale peers
 			removed := a.peers.removeStale(a.config.HeartbeatTimeout)
+
+			// Notify pending requests about removed peers
+			for _, addr := range removed {
+				a.notifyPeerLeft(addr)
+			}
+
 			a.mu.RLock()
 			handler := a.onPeerLeave
 			a.mu.RUnlock()
