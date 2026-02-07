@@ -3,6 +3,7 @@ package alan
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -168,7 +169,7 @@ func TestDecrypt_InvalidMessage(t *testing.T) {
 
 	// Too short
 	_, err = a.decrypt([]byte("short"))
-	if err != ErrMessageTooShort {
+	if !errors.Is(err, ErrMessageTooShort) {
 		t.Errorf("expected ErrMessageTooShort, got %v", err)
 	}
 
@@ -176,7 +177,7 @@ func TestDecrypt_InvalidMessage(t *testing.T) {
 	ciphertext, _ := a.encrypt([]byte("test"))
 	ciphertext[len(ciphertext)-1] ^= 0xFF // Flip last byte
 	_, err = a.decrypt(ciphertext)
-	if err != ErrDecryptionFailed {
+	if !errors.Is(err, ErrDecryptionFailed) {
 		t.Errorf("expected ErrDecryptionFailed, got %v", err)
 	}
 }
@@ -800,7 +801,7 @@ func TestSendAndWaitReply_Timeout(t *testing.T) {
 	replies, err := a1.SendAndWaitReply(reqCtx, []byte("request"))
 
 	// Should return with context deadline exceeded and empty replies
-	if err != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("expected context.DeadlineExceeded, got %v", err)
 	}
 
@@ -870,7 +871,7 @@ func TestSendAndWaitReply_PartialResponses(t *testing.T) {
 	replies, err := a1.SendAndWaitReply(reqCtx, []byte("request"))
 
 	// Should timeout but return partial responses
-	if err != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("expected context.DeadlineExceeded, got %v", err)
 	}
 
@@ -1120,7 +1121,7 @@ func TestSendToAndWaitReply_PeerDisconnects(t *testing.T) {
 	// Wait for result
 	select {
 	case err := <-resultChan:
-		if err != ErrPeerDisconnected {
+		if !errors.Is(err, ErrPeerDisconnected) {
 			t.Errorf("expected ErrPeerDisconnected, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
