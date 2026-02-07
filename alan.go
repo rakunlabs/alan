@@ -55,6 +55,10 @@ type Config struct {
 	HeartbeatTimeout time.Duration `cfg:"heartbeat_timeout" json:"heartbeat_timeout"`
 	// RefreshInterval is how often to re-resolve DNS (default: 30s, set to -1 to disable)
 	RefreshInterval time.Duration `cfg:"refresh_interval" json:"refresh_interval"`
+	// MessageQueueSize is the per-peer message buffer size (default: 256)
+	// Messages from the same peer are processed in order.
+	// When the queue is full, the listener blocks until space is available.
+	MessageQueueSize int `cfg:"message_queue_size" json:"message_queue_size"`
 }
 
 // SecurityConfig holds encryption settings
@@ -105,6 +109,26 @@ type pendingRequest struct {
 	peerLeftChan chan *net.UDPAddr
 }
 
+// peerQueue manages ordered message processing for a single peer
+type peerQueue struct {
+	ch     chan Message
+	cancel context.CancelFunc
+}
+
+// peerEventType indicates whether a peer joined or left
+type peerEventType int
+
+const (
+	peerEventJoin peerEventType = iota
+	peerEventLeave
+)
+
+// peerEvent represents a peer join or leave event
+type peerEvent struct {
+	eventType peerEventType
+	addr      *net.UDPAddr
+}
+
 // SendResult contains the result of sending to a single peer
 type SendResult struct {
 	// Addr is the peer address
@@ -138,6 +162,14 @@ type Alan struct {
 	pendingRequests   map[string]*pendingRequest
 	pendingRequestsMu sync.RWMutex
 
+	// Per-peer message queues for ordered processing
+	peerQueues   map[string]*peerQueue
+	peerQueuesMu sync.RWMutex
+
+	// Peer event queue for ordered join/leave processing
+	peerEventCh     chan peerEvent
+	peerEventCancel context.CancelFunc
+
 	// Callbacks
 	onPeerJoin  PeerHandler
 	onPeerLeave PeerHandler
@@ -165,12 +197,17 @@ func New(config Config) (*Alan, error) {
 	if config.RefreshInterval == 0 {
 		config.RefreshInterval = 30 * time.Second
 	}
+	if config.MessageQueueSize == 0 {
+		config.MessageQueueSize = 256
+	}
 
 	a := &Alan{
 		config:          config,
 		peers:           newPeers(),
 		readyChan:       make(chan struct{}),
 		pendingRequests: make(map[string]*pendingRequest),
+		peerQueues:      make(map[string]*peerQueue),
+		peerEventCh:     make(chan peerEvent, config.MessageQueueSize),
 	}
 
 	// Initialize encryption if security is enabled
@@ -269,6 +306,11 @@ func (a *Alan) Start(ctx context.Context, handler MessageHandler) error {
 		go a.refreshLoop()
 	}
 
+	// Start peer event worker for ordered join/leave processing
+	peerEventCtx, peerEventCancel := context.WithCancel(a.ctx)
+	a.peerEventCancel = peerEventCancel
+	go a.peerEventWorker(peerEventCtx)
+
 	// Signal that we're ready to send/receive
 	close(a.readyChan)
 
@@ -288,6 +330,14 @@ func (a *Alan) Stop() error {
 
 	// Send LEAVE to all peers
 	a.broadcastControl(MsgTypeLeave)
+
+	// Close all peer message queues
+	a.closeAllPeerQueues()
+
+	// Close peer event queue
+	if a.peerEventCancel != nil {
+		a.peerEventCancel()
+	}
 
 	// Cancel context and close stop channel
 	if a.cancel != nil {
@@ -738,12 +788,7 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 		}
 		peerAddr := buildPeerAddr(sourceAddr, port)
 		if isNew := a.peers.add(peerAddr); isNew {
-			a.mu.RLock()
-			handler := a.onPeerJoin
-			a.mu.RUnlock()
-			if handler != nil {
-				go handler(peerAddr)
-			}
+			a.enqueuePeerEvent(peerEventJoin, peerAddr)
 		}
 
 	case MsgTypeLeave:
@@ -756,12 +801,10 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 			// Notify pending requests that this peer left
 			a.notifyPeerLeft(peerAddr)
 
-			a.mu.RLock()
-			handler := a.onPeerLeave
-			a.mu.RUnlock()
-			if handler != nil {
-				go handler(peerAddr)
-			}
+			// Remove the peer's message queue
+			a.removePeerQueue(peerAddr)
+
+			a.enqueuePeerEvent(peerEventLeave, peerAddr)
 		}
 
 	case MsgTypeHeartbeat:
@@ -772,32 +815,23 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 		peerAddr := buildPeerAddr(sourceAddr, port)
 		// Add peer if new (in case we missed the JOIN)
 		if isNew := a.peers.add(peerAddr); isNew {
-			a.mu.RLock()
-			handler := a.onPeerJoin
-			a.mu.RUnlock()
-			if handler != nil {
-				go handler(peerAddr)
-			}
+			a.enqueuePeerEvent(peerEventJoin, peerAddr)
 		}
 
 	case MsgTypeData:
 		// Update last seen time for the peer (keeps peer alive even without heartbeats)
 		a.peers.updateLastSeen(sourceAddr)
 
-		a.mu.RLock()
-		handler := a.onMessage
-		a.mu.RUnlock()
-		if handler != nil {
-			// Copy payload to avoid buffer reuse issues when handler runs in goroutine
-			payloadCopy := make([]byte, len(payload))
-			copy(payloadCopy, payload)
+		// Copy payload to avoid buffer reuse issues
+		payloadCopy := make([]byte, len(payload))
+		copy(payloadCopy, payload)
 
-			msg := Message{
-				Data: payloadCopy,
-				Addr: sourceAddr,
-			}
-			go handler(a.ctx, msg)
+		msg := Message{
+			Data: payloadCopy,
+			Addr: sourceAddr,
 		}
+		// Enqueue for ordered processing (blocks if queue full)
+		a.enqueueMessage(sourceAddr, msg)
 
 	case MsgTypeRequest:
 		// Update last seen time for the peer
@@ -808,23 +842,19 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 			return
 		}
 
-		a.mu.RLock()
-		handler := a.onMessage
-		a.mu.RUnlock()
-		if handler != nil {
-			// Copy data to avoid buffer reuse issues when handler runs in goroutine
-			dataCopy := make([]byte, len(data))
-			copy(dataCopy, data)
-			requestIDCopy := make([]byte, len(requestID))
-			copy(requestIDCopy, requestID)
+		// Copy data to avoid buffer reuse issues
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+		requestIDCopy := make([]byte, len(requestID))
+		copy(requestIDCopy, requestID)
 
-			msg := Message{
-				Data:      dataCopy,
-				Addr:      sourceAddr,
-				requestID: requestIDCopy,
-			}
-			go handler(a.ctx, msg)
+		msg := Message{
+			Data:      dataCopy,
+			Addr:      sourceAddr,
+			requestID: requestIDCopy,
 		}
+		// Enqueue for ordered processing (blocks if queue full)
+		a.enqueueMessage(sourceAddr, msg)
 
 	case MsgTypeResponse:
 		// Update last seen time for the peer
@@ -892,18 +922,11 @@ func (a *Alan) heartbeatLoop() {
 			// Remove stale peers
 			removed := a.peers.removeStale(a.config.HeartbeatTimeout)
 
-			// Notify pending requests about removed peers
+			// Notify pending requests, remove queues, and enqueue leave events
 			for _, addr := range removed {
 				a.notifyPeerLeft(addr)
-			}
-
-			a.mu.RLock()
-			handler := a.onPeerLeave
-			a.mu.RUnlock()
-			if handler != nil {
-				for _, addr := range removed {
-					go handler(addr)
-				}
+				a.removePeerQueue(addr)
+				a.enqueuePeerEvent(peerEventLeave, addr)
 			}
 		}
 	}
@@ -960,14 +983,149 @@ func (a *Alan) Refresh() error {
 			processed, _ := a.processOutgoing(msg)
 			a.conn.WriteToUDP(processed, peerAddr)
 
-			a.mu.RLock()
-			handler := a.onPeerJoin
-			a.mu.RUnlock()
-			if handler != nil {
-				go handler(peerAddr)
-			}
+			a.enqueuePeerEvent(peerEventJoin, peerAddr)
 		}
 	}
 
 	return nil
+}
+
+// getOrCreatePeerQueue returns the message queue for a peer, creating one if it doesn't exist.
+// The queue ensures messages from the same peer are processed in order.
+func (a *Alan) getOrCreatePeerQueue(addr *net.UDPAddr) *peerQueue {
+	key := addr.String()
+
+	// Fast path: check if queue already exists
+	a.peerQueuesMu.RLock()
+	pq, exists := a.peerQueues[key]
+	a.peerQueuesMu.RUnlock()
+	if exists {
+		return pq
+	}
+
+	// Slow path: create new queue
+	a.peerQueuesMu.Lock()
+	defer a.peerQueuesMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if pq, exists = a.peerQueues[key]; exists {
+		return pq
+	}
+
+	// Create new queue with its own context
+	ctx, cancel := context.WithCancel(a.ctx)
+	pq = &peerQueue{
+		ch:     make(chan Message, a.config.MessageQueueSize),
+		cancel: cancel,
+	}
+	a.peerQueues[key] = pq
+
+	// Start worker goroutine for this peer
+	go a.peerWorker(ctx, pq)
+
+	return pq
+}
+
+// removePeerQueue closes and removes the message queue for a peer.
+// Any pending messages in the queue are discarded.
+func (a *Alan) removePeerQueue(addr *net.UDPAddr) {
+	key := addr.String()
+
+	a.peerQueuesMu.Lock()
+	pq, exists := a.peerQueues[key]
+	if exists {
+		delete(a.peerQueues, key)
+	}
+	a.peerQueuesMu.Unlock()
+
+	if exists && pq != nil {
+		pq.cancel() // Signal worker to stop
+	}
+}
+
+// closeAllPeerQueues closes all peer message queues.
+// Called during shutdown.
+func (a *Alan) closeAllPeerQueues() {
+	a.peerQueuesMu.Lock()
+	defer a.peerQueuesMu.Unlock()
+
+	for _, pq := range a.peerQueues {
+		pq.cancel()
+	}
+	a.peerQueues = make(map[string]*peerQueue)
+}
+
+// enqueueMessage adds a message to the peer's queue for ordered processing.
+// Blocks if the queue is full (backpressure).
+func (a *Alan) enqueueMessage(addr *net.UDPAddr, msg Message) {
+	pq := a.getOrCreatePeerQueue(addr)
+
+	// Block if queue is full - this provides backpressure
+	select {
+	case pq.ch <- msg:
+		// Message queued successfully
+	case <-a.ctx.Done():
+		// Shutting down, discard message
+	}
+}
+
+// peerWorker processes messages from a peer's queue in order.
+// One worker goroutine runs per peer.
+func (a *Alan) peerWorker(ctx context.Context, pq *peerQueue) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-pq.ch:
+			if !ok {
+				return
+			}
+
+			a.mu.RLock()
+			handler := a.onMessage
+			a.mu.RUnlock()
+
+			if handler != nil {
+				handler(ctx, msg)
+			}
+		}
+	}
+}
+
+// enqueuePeerEvent adds a peer join/leave event to the queue for ordered processing.
+// Blocks if the queue is full (backpressure).
+func (a *Alan) enqueuePeerEvent(eventType peerEventType, addr *net.UDPAddr) {
+	select {
+	case a.peerEventCh <- peerEvent{eventType: eventType, addr: addr}:
+		// Event queued successfully
+	case <-a.ctx.Done():
+		// Shutting down, discard event
+	}
+}
+
+// peerEventWorker processes peer join/leave events in order.
+func (a *Alan) peerEventWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-a.peerEventCh:
+			if !ok {
+				return
+			}
+
+			a.mu.RLock()
+			var handler PeerHandler
+			if event.eventType == peerEventJoin {
+				handler = a.onPeerJoin
+			} else {
+				handler = a.onPeerLeave
+			}
+			a.mu.RUnlock()
+
+			if handler != nil {
+				handler(event.addr)
+			}
+		}
+	}
 }

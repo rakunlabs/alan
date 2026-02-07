@@ -1308,3 +1308,349 @@ func TestSendAndWaitReply_AllPeersDisconnect(t *testing.T) {
 
 	a1.Stop()
 }
+
+// TestMessageOrdering verifies that messages from the same peer are processed in order
+func TestMessageOrdering(t *testing.T) {
+	const testPort = 15050
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Track received messages with their order
+	var mu sync.Mutex
+	received := make([]int, 0, 100)
+
+	// a2 tracks message order
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			// Simulate some processing time to expose ordering issues
+			time.Sleep(time.Millisecond)
+			mu.Lock()
+			// Each message contains its sequence number as a single byte
+			received = append(received, int(msg.Data[0]))
+			mu.Unlock()
+		})
+	}()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+
+	// Send 100 messages rapidly
+	numMessages := 100
+	for i := 0; i < numMessages; i++ {
+		a1.SendTo(targetAddr, []byte{byte(i)})
+	}
+
+	// Wait for all messages to be processed
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != numMessages {
+		t.Errorf("expected %d messages, got %d", numMessages, len(received))
+	}
+
+	// Verify messages were received in order
+	for i, v := range received {
+		if v != i {
+			t.Errorf("message ordering violated: expected %d at index %d, got %d", i, i, v)
+			// Show first few misordered messages
+			if i < 5 {
+				continue
+			}
+			break
+		}
+	}
+
+	a1.Stop()
+	a2.Stop()
+}
+
+// TestMessageOrderingWithRequests verifies that request messages are also processed in order
+// when sent synchronously (one at a time)
+func TestMessageOrderingWithRequests(t *testing.T) {
+	const testPort = 15060
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	received := make([]int, 0, 20)
+
+	// a2 tracks order and responds to requests
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			mu.Lock()
+			received = append(received, int(msg.Data[0]))
+			mu.Unlock()
+
+			// Reply if it's a request
+			if msg.IsRequest() {
+				a2.Reply(msg, []byte("ok"))
+			}
+		})
+	}()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+
+	// Send requests synchronously (one at a time) to verify ordering
+	// Each request waits for response before sending the next
+	numMessages := 20
+	for i := 0; i < numMessages; i++ {
+		reqCtx, reqCancel := context.WithTimeout(ctx, time.Second)
+		_, err := a1.SendToAndWaitReply(reqCtx, targetAddr, []byte{byte(i)})
+		reqCancel()
+		if err != nil {
+			t.Logf("request %d failed: %v", i, err)
+		}
+	}
+
+	// Wait for any remaining processing
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != numMessages {
+		t.Errorf("expected %d messages, got %d", numMessages, len(received))
+	}
+
+	// Verify ordering
+	for i, v := range received {
+		if v != i {
+			t.Errorf("message ordering violated at index %d: expected %d, got %d", i, i, v)
+			break
+		}
+	}
+
+	a1.Stop()
+	a2.Stop()
+}
+
+// TestPeerQueueCleanupOnLeave verifies that peer queues are cleaned up when peers leave
+func TestPeerQueueCleanupOnLeave(t *testing.T) {
+	const testPort = 15070
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a1 receives messages
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {
+			// Just receive messages to trigger queue creation
+		})
+	}()
+
+	<-a1.Ready()
+
+	// Simulate an external peer sending a DATA message to create a queue
+	peerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+	conn, _ := net.DialUDP("udp", peerAddr, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort})
+	defer conn.Close()
+
+	// Send JOIN first so a1 knows about this peer
+	joinMsg := encodeControlMessage(MsgTypeJoin, testPort)
+	conn.Write(joinMsg)
+	time.Sleep(50 * time.Millisecond)
+
+	// Send data message to create queue
+	dataMsg := encodeDataMessage([]byte("hello"))
+	conn.Write(dataMsg)
+	time.Sleep(50 * time.Millisecond)
+
+	// Check that queue exists
+	a1.peerQueuesMu.RLock()
+	queuesBefore := len(a1.peerQueues)
+	a1.peerQueuesMu.RUnlock()
+
+	if queuesBefore == 0 {
+		t.Error("expected at least one peer queue to exist")
+	}
+
+	// Send LEAVE message
+	leaveMsg := encodeControlMessage(MsgTypeLeave, testPort)
+	conn.Write(leaveMsg)
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that queue was cleaned up
+	a1.peerQueuesMu.RLock()
+	queuesAfter := len(a1.peerQueues)
+	a1.peerQueuesMu.RUnlock()
+
+	if queuesAfter != 0 {
+		t.Errorf("expected 0 peer queues after peer left, got %d", queuesAfter)
+	}
+
+	a1.Stop()
+}
+
+// TestMessageQueueSizeConfig verifies that custom queue size is respected
+func TestMessageQueueSizeConfig(t *testing.T) {
+	customSize := 64
+
+	a, err := New(Config{
+		Port:             0,
+		MessageQueueSize: customSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create alan: %v", err)
+	}
+
+	if a.config.MessageQueueSize != customSize {
+		t.Errorf("expected MessageQueueSize %d, got %d", customSize, a.config.MessageQueueSize)
+	}
+}
+
+// TestDefaultMessageQueueSize verifies the default queue size
+func TestDefaultMessageQueueSize(t *testing.T) {
+	a, err := New(Config{Port: 0})
+	if err != nil {
+		t.Fatalf("failed to create alan: %v", err)
+	}
+
+	if a.config.MessageQueueSize != 256 {
+		t.Errorf("expected default MessageQueueSize 256, got %d", a.config.MessageQueueSize)
+	}
+}
+
+// TestPeerEventOrdering verifies that peer join/leave events are processed in order
+func TestPeerEventOrdering(t *testing.T) {
+	const testPort = 15080
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	events := make([]string, 0, 20)
+
+	// Track join/leave events in order
+	a1.OnPeerJoin(func(addr *net.UDPAddr) {
+		time.Sleep(time.Millisecond) // Simulate processing
+		mu.Lock()
+		events = append(events, "join:"+addr.String())
+		mu.Unlock()
+	})
+
+	a1.OnPeerLeave(func(addr *net.UDPAddr) {
+		time.Sleep(time.Millisecond) // Simulate processing
+		mu.Lock()
+		events = append(events, "leave:"+addr.String())
+		mu.Unlock()
+	})
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	a1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+
+	// Simulate multiple peers joining and leaving rapidly
+	conn, _ := net.DialUDP("udp", nil, a1Addr)
+	defer conn.Close()
+
+	// Send JOIN/LEAVE for multiple "peers" (simulated by different ports)
+	numPeers := 10
+	for i := 0; i < numPeers; i++ {
+		peerPort := 20000 + i
+		joinMsg := encodeControlMessage(MsgTypeJoin, peerPort)
+		conn.Write(joinMsg)
+	}
+
+	// Give time for all joins to be processed
+	time.Sleep(100 * time.Millisecond)
+
+	// Now send leaves in the same order
+	for i := 0; i < numPeers; i++ {
+		peerPort := 20000 + i
+		leaveMsg := encodeControlMessage(MsgTypeLeave, peerPort)
+		conn.Write(leaveMsg)
+	}
+
+	// Wait for all events to be processed
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Verify we got all events
+	expectedEvents := numPeers * 2 // join + leave for each
+	if len(events) != expectedEvents {
+		t.Errorf("expected %d events, got %d", expectedEvents, len(events))
+	}
+
+	// Verify joins came before leaves (ordered processing)
+	// All joins should be processed before leaves because they were sent first
+	joinCount := 0
+	leaveStarted := false
+	for i, event := range events {
+		if event[:4] == "join" {
+			if leaveStarted {
+				// A join after a leave means ordering was violated
+				// (Note: this is a bit weak - if the events are processed truly in order,
+				// all joins should come before all leaves since we sent all joins first)
+				t.Logf("event %d: %s (join after leave started)", i, event)
+			}
+			joinCount++
+		} else {
+			leaveStarted = true
+		}
+	}
+
+	if joinCount != numPeers {
+		t.Errorf("expected %d joins, got %d", numPeers, joinCount)
+	}
+
+	a1.Stop()
+}

@@ -179,6 +179,11 @@ type Config struct {
     // Note: Refresh only adds new peers; stale peers are removed via heartbeat timeout
     RefreshInterval time.Duration
     
+    // MessageQueueSize - per-peer message buffer size (default: 256)
+    // Messages from the same peer are processed in order.
+    // When the queue is full, the listener blocks until space is available.
+    MessageQueueSize int
+    
     // Security for encryption (optional)
     Security *SecurityConfig
 }
@@ -218,6 +223,26 @@ The library uses a simple internal protocol:
 - **HEARTBEAT**: Sent every `HeartbeatInterval` to all peers
 - **LEAVE**: Sent on `Stop()` to notify peers of graceful shutdown
 - **Timeout**: Peers not seen within `HeartbeatTimeout` are removed
+
+### Message Ordering
+
+Messages from the same peer are guaranteed to be processed in order:
+
+- Each peer has a dedicated message queue (per-peer channel)
+- A worker goroutine processes messages from each queue sequentially
+- This ensures DATA and REQUEST messages from the same peer are handled in the order received
+- Queue size is configurable via `MessageQueueSize` (default: 256)
+- When a queue is full, the listener blocks (backpressure)
+- Queues are automatically cleaned up when peers leave or timeout
+
+### Peer Event Ordering
+
+Peer join/leave events are also processed in order:
+
+- A single event queue handles all `OnPeerJoin` and `OnPeerLeave` callbacks
+- Events are processed sequentially by a dedicated worker
+- When the queue is full, the listener blocks (backpressure)
+- This ensures handlers see events in the order they occurred
 
 ### Security
 
