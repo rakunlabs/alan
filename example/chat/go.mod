@@ -1,8 +1,8 @@
-module github.com/rakunlabs/alan/example
+module github.com/rakunlabs/alan/example/chat
 
 go 1.25
 
-replace github.com/rakunlabs/alan => ../
+replace github.com/rakunlabs/alan => ../../
 
 require (
 	github.com/charmbracelet/bubbles v0.21.1

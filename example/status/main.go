@@ -1,0 +1,161 @@
+package main
+
+import (
+	"context"
+	"log/slog"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+	"github.com/rakunlabs/ada"
+	"github.com/rakunlabs/alan"
+	"github.com/rakunlabs/chu"
+	"github.com/rakunlabs/chu/loader/loaderenv"
+	"github.com/rakunlabs/into"
+	"github.com/rakunlabs/logi"
+	"golang.org/x/sync/errgroup"
+)
+
+var (
+	id string
+	al *alan.Alan
+
+	// pendingRequests maps request IDs to their response channels
+	pendingRequests   = make(map[string]chan string)
+	pendingRequestsMu sync.RWMutex
+)
+
+func main() {
+	into.Init(
+		run,
+		into.WithLogger(logi.InitializeLog(logi.WithCaller(false))),
+		into.WithMsgf("alan status example"),
+	)
+}
+
+func run(ctx context.Context) error {
+	cfg := alan.Config{}
+
+	// Load config from environment
+	if err := chu.Load(ctx, "alan", &cfg, chu.WithLoaderOption(
+		loaderenv.New(
+			loaderenv.WithPrefix("ALAN_"),
+		)),
+	); err != nil {
+		return err
+	}
+
+	// ///////////////////////////////////////////
+
+	id = ulid.Make().String()
+
+	// ///////////////////////////////////////////
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	// ///////////////////////////////////////////
+
+	var err error
+	al, err = alan.New(cfg)
+	if err != nil {
+		return err
+	}
+
+	al.OnPeerJoin(func(addr *net.UDPAddr) {
+		slog.Info("peer joined", "addr", addr.String())
+	})
+
+	al.OnPeerLeave(func(addr *net.UDPAddr) {
+		slog.Info("peer left", "addr", addr.String())
+	})
+
+	g.Go(func() error {
+		return al.Start(ctx, AlanHandler)
+	})
+
+	// ///////////////////////////////////////////
+
+	server := ada.New()
+	server.GET("/status", server.Wrap(HttpHandler))
+	server.GET("/healthz", server.Wrap(func(a *ada.Context) error {
+		return a.SendString("OK")
+	}))
+
+	g.Go(func() error {
+		return server.StartWithContext(ctx, ":8080")
+	})
+
+	// ///////////////////////////////////////////
+
+	return g.Wait()
+}
+
+func HttpHandler(a *ada.Context) error {
+	peerCount := al.PeerCount()
+
+	// Generate unique request ID for this HTTP request
+	reqID := ulid.Make().String()
+
+	// Create response channel for this request
+	respChan := make(chan string, peerCount)
+	pendingRequestsMu.Lock()
+	pendingRequests[reqID] = respChan
+	pendingRequestsMu.Unlock()
+
+	// Cleanup when done
+	defer func() {
+		pendingRequestsMu.Lock()
+		delete(pendingRequests, reqID)
+		pendingRequestsMu.Unlock()
+	}()
+
+	// Send request to all peers with our request ID
+	al.Send([]byte("REQ-ID:" + reqID))
+
+	// Collect responses with timeout
+	responses := make([]string, 0, peerCount)
+	timeout := time.After(10 * time.Second)
+
+	for len(responses) < peerCount {
+		select {
+		case resp := <-respChan:
+			responses = append(responses, resp)
+		case <-timeout:
+			// Timeout - return what we have
+			return a.SendJSON(responses)
+		}
+	}
+
+	return a.SendJSON(responses)
+}
+
+func AlanHandler(ctx context.Context, msg alan.Message) {
+	data := string(msg.Data)
+
+	if after, ok := strings.CutPrefix(data, "REQ-ID:"); ok {
+		// This is a request - extract reqID and respond with our ID
+		reqID := after
+		al.SendTo(msg.Addr, []byte("RESP:"+reqID+":"+id))
+	} else if after, ok := strings.CutPrefix(data, "RESP:"); ok {
+		// This is a response - route to correct channel
+		parts := strings.SplitN(after, ":", 2)
+		if len(parts) == 2 {
+			reqID := parts[0]
+			peerID := parts[1]
+
+			pendingRequestsMu.RLock()
+			respChan, ok := pendingRequests[reqID]
+			pendingRequestsMu.RUnlock()
+
+			if ok {
+				select {
+				case respChan <- peerID:
+				default:
+					// Channel full, skip
+				}
+			}
+		}
+	}
+}

@@ -19,7 +19,7 @@ const (
 )
 
 // Protocol message format:
-// [Type: 1 byte][Payload]
+//   [Type: 1 byte][Payload]
 //
 // For JOIN/LEAVE/HEARTBEAT:
 //   [Type: 1 byte][Port: 2 bytes (big endian)]

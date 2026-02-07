@@ -16,9 +16,9 @@ A terminal-based peer-to-peer chat application using the Alan library for encryp
 Add the following entries to `/etc/hosts` to enable local peer discovery:
 
 ```
-127.0.0.1  alan-chat.local
-127.0.0.2  alan-chat.local
-127.0.0.3  alan-chat.local
+127.0.1.1  alan-chat.local
+127.0.1.2  alan-chat.local
+127.0.1.3  alan-chat.local
 ```
 
 ## Running the Example
@@ -27,13 +27,13 @@ Open multiple terminals and run with different bind addresses:
 
 ```bash
 # Terminal 1
-ALAN_BIND_ADDR=127.0.0.1 ALAN_NAME=Ada go run .
+ALAN_BIND_ADDR=127.0.1.1 ALAN_NAME=Ada go run .
 
 # Terminal 2
-ALAN_BIND_ADDR=127.0.0.2 ALAN_NAME=Selin go run .
+ALAN_BIND_ADDR=127.0.1.2 ALAN_NAME=Selin go run .
 
 # Terminal 3
-ALAN_BIND_ADDR=127.0.0.3 ALAN_NAME=Eray go run .
+ALAN_BIND_ADDR=127.0.1.3 ALAN_NAME=Eray go run .
 ```
 
 ## Environment Variables
@@ -62,9 +62,9 @@ ALAN_BIND_ADDR=127.0.0.3 ALAN_NAME=Eray go run .
 │  Alan Chat - Ada (online | 2 peers)                             │
 ├──────────────────────────────────────────────┬──────────────────┤
 │ [12:34:05] Connected as Ada. Waiting...      │ Peers (2)        │
-│ [12:34:08] 127.0.0.2:5000 joined             │──────────────────│
-│ [12:34:10] Selin: Hello everyone!            │ ● 127.0.0.2:5000 │
-│ [12:34:12] Ada: Hey Selin!                   │ ● 127.0.0.3:5000 │
+│ [12:34:08] 127.0.1.2:5000 joined             │──────────────────│
+│ [12:34:10] Selin: Hello everyone!            │ ● 127.0.1.2:5000 │
+│ [12:34:12] Ada: Hey Selin!                   │ ● 127.0.1.3:5000 │
 │ [12:34:15] Eray: Hi all!                     │                  │
 │                                              │                  │
 ├──────────────────────────────────────────────┴──────────────────┤
