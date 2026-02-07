@@ -175,7 +175,8 @@ type Config struct {
     // HeartbeatTimeout - when a peer is considered dead (default: 15s)
     HeartbeatTimeout time.Duration
     
-    // RefreshInterval - how often to re-resolve DNS (default: 0 = disabled)
+    // RefreshInterval - how often to re-resolve DNS (default: 30s, set to -1 to disable)
+    // Note: Refresh only adds new peers; stale peers are removed via heartbeat timeout
     RefreshInterval time.Duration
     
     // Security for encryption (optional)
