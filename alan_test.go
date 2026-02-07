@@ -57,12 +57,15 @@ func TestNew(t *testing.T) {
 		}
 	})
 
-	t.Run("missing DNSAddr", func(t *testing.T) {
-		_, err := New(Config{
+	t.Run("empty DNSAddr allowed", func(t *testing.T) {
+		a, err := New(Config{
 			Port: 5000,
 		})
-		if err != ErrDNSAddrRequired {
-			t.Errorf("expected ErrDNSAddrRequired, got %v", err)
+		if err != nil {
+			t.Errorf("expected no error for empty DNSAddr, got %v", err)
+		}
+		if a == nil {
+			t.Error("expected Alan instance to be created")
 		}
 	})
 
@@ -84,6 +87,9 @@ func TestNew(t *testing.T) {
 		}
 		if a.config.HeartbeatTimeout != 15*time.Second {
 			t.Errorf("expected default heartbeat timeout 15s, got %v", a.config.HeartbeatTimeout)
+		}
+		if a.config.RefreshInterval != 30*time.Second {
+			t.Errorf("expected default refresh interval 30s, got %v", a.config.RefreshInterval)
 		}
 	})
 }

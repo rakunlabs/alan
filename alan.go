@@ -21,8 +21,7 @@ var (
 	ErrMessageTooShort = errors.New("encrypted message too short")
 	// ErrDecryptionFailed is returned when message authentication fails
 	ErrDecryptionFailed = errors.New("decryption failed: message authentication failed")
-	// ErrDNSAddrRequired is returned when DNSAddr is not configured
-	ErrDNSAddrRequired = errors.New("DNSAddr is required in config")
+
 	// ErrAlreadyStarted is returned when Start is called on an already running instance
 	ErrAlreadyStarted = errors.New("alan is already started")
 	// ErrNotStarted is returned when operations are attempted before Start
@@ -31,7 +30,9 @@ var (
 
 // Config holds all configuration for Alan
 type Config struct {
-	// DNSAddr is the DNS name to resolve for discovering peers (required)
+	// DNSAddr is the DNS name to resolve for discovering peers (optional).
+	// If empty or DNS resolution fails, the library will still start and
+	// can discover peers through incoming messages or later DNS resolution.
 	DNSAddr string `cfg:"dns_addr" json:"dns_addr"`
 	// BindAddr is the local address to bind to (default: "0.0.0.0" for all interfaces)
 	BindAddr string `cfg:"bind_addr" json:"bind_addr"`
@@ -48,7 +49,7 @@ type Config struct {
 	HeartbeatInterval time.Duration `cfg:"heartbeat_interval" json:"heartbeat_interval"`
 	// HeartbeatTimeout is when a peer is considered dead (default: 15s)
 	HeartbeatTimeout time.Duration `cfg:"heartbeat_timeout" json:"heartbeat_timeout"`
-	// RefreshInterval is how often to re-resolve DNS (default: 0 = disabled)
+	// RefreshInterval is how often to re-resolve DNS (default: 30s, set to -1 to disable)
 	RefreshInterval time.Duration `cfg:"refresh_interval" json:"refresh_interval"`
 }
 
@@ -112,11 +113,6 @@ type Alan struct {
 
 // New creates a new Alan instance with the given configuration.
 func New(config Config) (*Alan, error) {
-	// Validate required fields
-	if config.DNSAddr == "" {
-		return nil, ErrDNSAddrRequired
-	}
-
 	// Set defaults
 	if config.Port == 0 {
 		config.Port = 5000
@@ -132,6 +128,9 @@ func New(config Config) (*Alan, error) {
 	}
 	if config.HeartbeatTimeout == 0 {
 		config.HeartbeatTimeout = 15 * time.Second
+	}
+	if config.RefreshInterval == 0 {
+		config.RefreshInterval = 30 * time.Second
 	}
 
 	a := &Alan{
@@ -172,7 +171,7 @@ func (a *Alan) OnPeerLeave(handler PeerHandler) {
 }
 
 // Start initializes the peer discovery system:
-// - Resolves DNSAddr to discover initial peers
+// - Resolves DNSAddr to discover initial peers (if configured and resolvable)
 // - Starts UDP server
 // - Sends JOIN to all peers
 // - Starts heartbeat goroutine
@@ -376,11 +375,19 @@ func (a *Alan) Ready() <-chan struct{} {
 	return a.readyChan
 }
 
-// discoverPeers resolves DNS and adds initial peers
+// discoverPeers resolves DNS and adds initial peers.
+// If DNSAddr is empty or DNS resolution fails, it silently returns without error.
+// Peers may be discovered later via DNS refresh or incoming messages.
 func (a *Alan) discoverPeers() error {
+	if a.config.DNSAddr == "" {
+		return nil
+	}
+
 	ips, err := lookupIP(a.config.DNSAddr)
 	if err != nil {
-		return err
+		// DNS resolution failed, but we don't fail startup
+		// Peers may resolve later via refresh
+		return nil
 	}
 
 	localAddr := a.conn.LocalAddr().(*net.UDPAddr)
@@ -518,6 +525,9 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 		}
 
 	case MsgTypeData:
+		// Update last seen time for the peer (keeps peer alive even without heartbeats)
+		a.peers.updateLastSeen(sourceAddr)
+
 		a.mu.RLock()
 		handler := a.onMessage
 		a.mu.RUnlock()
@@ -592,11 +602,18 @@ func (a *Alan) refreshLoop() {
 	}
 }
 
-// Refresh re-resolves DNS and discovers new peers
+// Refresh re-resolves DNS and discovers new peers.
+// If DNSAddr is empty or DNS resolution fails, it returns nil without error.
 func (a *Alan) Refresh() error {
+	if a.config.DNSAddr == "" {
+		return nil
+	}
+
 	ips, err := lookupIP(a.config.DNSAddr)
 	if err != nil {
-		return err
+		// DNS resolution failed, but we don't fail
+		// It may resolve later
+		return nil
 	}
 
 	localAddr := a.conn.LocalAddr().(*net.UDPAddr)
