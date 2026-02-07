@@ -17,10 +17,10 @@ jobs:
     - name: golangci-lint
       uses: golangci/golangci-lint-action@v9
       with:
-        args: --timeout 5m --new-from-rev=HEAD~1 --issues-exit-code=0
+        install-only: true
     - name: Run tests
       run: |
-        GOPATH="$(dirname ${PWD})" golangci-lint run --out-format checkstyle --issues-exit-code=0 ./... > golangci-lint-report.out
+        GOPATH="$(dirname ${PWD})" golangci-lint run --output.format checkstyle --issues-exit-code=0 ./... > golangci-lint-report.out
         go test -coverprofile=coverage.out -json ./... > test-report.out
     - name: SonarCloud Scan
       uses: sonarsource/sonarcloud-github-action@master
