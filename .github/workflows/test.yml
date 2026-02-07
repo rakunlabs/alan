@@ -20,7 +20,7 @@ jobs:
         install-only: true
     - name: Run tests
       run: |
-        GOPATH="$(dirname ${PWD})" golangci-lint run --output.format checkstyle --issues-exit-code=0 ./... > golangci-lint-report.out
+        GOPATH="$(dirname ${PWD})" golangci-lint run --output.checkstyle.path=golangci-lint-report.out --issues-exit-code=0 ./...
         go test -coverprofile=coverage.out -json ./... > test-report.out
     - name: SonarCloud Scan
       uses: sonarsource/sonarcloud-github-action@master
