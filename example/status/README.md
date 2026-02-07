@@ -4,6 +4,8 @@ This example demonstrates how to implement a status endpoint that queries multip
 
 ## Run in kubernetes
 
+> kubernetes example added with gateway api
+
 Build the image and push it to a registry:
 
 ```sh
@@ -11,7 +13,7 @@ Build the image and push it to a registry:
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o status main.go
 docker build -t alan-status:latest .
 # Load the image into kind
-kind load docker-image alan-status:latest
+kind load docker-image alan-status:latest -n kup
 # Deploy to kubernetes
 kubectl apply -f k8s.yaml
 # Redeploy to update the image

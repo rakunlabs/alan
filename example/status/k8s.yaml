@@ -29,6 +29,26 @@ spec:
       targetPort: 8080
       protocol: TCP
 ---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: alan-status-route
+spec:
+  parentRefs:
+  - name: kube
+    namespace: kube-gateway
+  hostnames:
+  - "alan-status.kube.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: alan-status
+      port: 8080
+      namespace: default
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -70,11 +90,11 @@ spec:
             httpGet:
               path: /healthz
               port: 8080
-            initialDelaySeconds: 5
+            initialDelaySeconds: 2
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8080
-            initialDelaySeconds: 10
+            initialDelaySeconds: 4
             periodSeconds: 30

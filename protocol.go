@@ -16,7 +16,14 @@ const (
 	MsgTypeHeartbeat byte = 0x03
 	// MsgTypeData is a user data message
 	MsgTypeData byte = 0x10
+	// MsgTypeRequest is a request message expecting a response
+	MsgTypeRequest byte = 0x20
+	// MsgTypeResponse is a response to a request message
+	MsgTypeResponse byte = 0x21
 )
+
+// RequestIDSize is the size of request IDs in bytes
+const RequestIDSize = 16
 
 // Protocol message format:
 //   [Type: 1 byte][Payload]
@@ -42,6 +49,34 @@ func encodeDataMessage(data []byte) []byte {
 	msg[0] = MsgTypeData
 	copy(msg[1:], data)
 	return msg
+}
+
+// encodeRequestMessage encodes a request message with a request ID
+// Format: [MsgTypeRequest:1][RequestID:16][Data:N]
+func encodeRequestMessage(requestID []byte, data []byte) []byte {
+	msg := make([]byte, 1+RequestIDSize+len(data))
+	msg[0] = MsgTypeRequest
+	copy(msg[1:1+RequestIDSize], requestID)
+	copy(msg[1+RequestIDSize:], data)
+	return msg
+}
+
+// encodeResponseMessage encodes a response message with the original request ID
+// Format: [MsgTypeResponse:1][RequestID:16][Data:N]
+func encodeResponseMessage(requestID []byte, data []byte) []byte {
+	msg := make([]byte, 1+RequestIDSize+len(data))
+	msg[0] = MsgTypeResponse
+	copy(msg[1:1+RequestIDSize], requestID)
+	copy(msg[1+RequestIDSize:], data)
+	return msg
+}
+
+// decodeRequestPayload extracts the request ID and data from a request/response payload
+func decodeRequestPayload(payload []byte) (requestID []byte, data []byte, err error) {
+	if len(payload) < RequestIDSize {
+		return nil, nil, fmt.Errorf("request payload too short: need at least %d bytes", RequestIDSize)
+	}
+	return payload[:RequestIDSize], payload[RequestIDSize:], nil
 }
 
 // decodeMessage decodes a protocol message and returns the type and payload

@@ -3,6 +3,8 @@ package alan
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -74,6 +76,27 @@ type Message struct {
 	Data []byte
 	// Addr is the sender's address
 	Addr *net.UDPAddr
+	// requestID is set for request messages (internal use)
+	requestID []byte
+}
+
+// IsRequest returns true if this message is a request expecting a reply
+func (m Message) IsRequest() bool {
+	return len(m.requestID) > 0
+}
+
+// Reply represents a response from a peer to a request
+type Reply struct {
+	// Data contains the response payload
+	Data []byte
+	// Addr is the responder's address
+	Addr *net.UDPAddr
+}
+
+// pendingRequest tracks an in-flight request waiting for responses
+type pendingRequest struct {
+	responseChan  chan Reply
+	expectedCount int
 }
 
 // SendResult contains the result of sending to a single peer
@@ -105,6 +128,10 @@ type Alan struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
+	// Pending requests for request-reply pattern
+	pendingRequests   map[string]*pendingRequest
+	pendingRequestsMu sync.RWMutex
+
 	// Callbacks
 	onPeerJoin  PeerHandler
 	onPeerLeave PeerHandler
@@ -134,9 +161,10 @@ func New(config Config) (*Alan, error) {
 	}
 
 	a := &Alan{
-		config:    config,
-		peers:     newPeers(),
-		readyChan: make(chan struct{}),
+		config:          config,
+		peers:           newPeers(),
+		readyChan:       make(chan struct{}),
+		pendingRequests: make(map[string]*pendingRequest),
 	}
 
 	// Initialize encryption if security is enabled
@@ -336,6 +364,167 @@ func (a *Alan) SendTo(addr *net.UDPAddr, data []byte) (int, error) {
 	return conn.WriteToUDP(processed, addr)
 }
 
+// SendAndWaitReply broadcasts a request to all peers and waits for their responses.
+// It returns all replies received before the context is cancelled or deadline exceeded.
+// The context should have a deadline/timeout set to control how long to wait.
+func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, error) {
+	a.mu.RLock()
+	if !a.running {
+		a.mu.RUnlock()
+		return nil, ErrNotStarted
+	}
+	conn := a.conn
+	a.mu.RUnlock()
+
+	// Get current peers
+	peers := a.peers.list()
+	if len(peers) == 0 {
+		return []Reply{}, nil
+	}
+
+	// Generate random request ID
+	requestID := make([]byte, RequestIDSize)
+	if _, err := rand.Read(requestID); err != nil {
+		return nil, fmt.Errorf("failed to generate request ID: %w", err)
+	}
+
+	// Encode as REQUEST message
+	msg := encodeRequestMessage(requestID, data)
+
+	// Encrypt if needed
+	processed, err := a.processOutgoing(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Register pending request
+	reqKey := hex.EncodeToString(requestID)
+	pending := &pendingRequest{
+		responseChan:  make(chan Reply, len(peers)+10), // Buffer for all expected responses + safety margin
+		expectedCount: len(peers),
+	}
+	a.pendingRequestsMu.Lock()
+	a.pendingRequests[reqKey] = pending
+	a.pendingRequestsMu.Unlock()
+
+	// Cleanup when done
+	defer func() {
+		a.pendingRequestsMu.Lock()
+		delete(a.pendingRequests, reqKey)
+		a.pendingRequestsMu.Unlock()
+	}()
+
+	// Send to all peers
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(addr *net.UDPAddr) {
+			defer wg.Done()
+			conn.WriteToUDP(processed, addr)
+		}(peer)
+	}
+	wg.Wait()
+
+	// Collect responses
+	replies := make([]Reply, 0, len(peers))
+	for {
+		select {
+		case <-ctx.Done():
+			return replies, ctx.Err()
+		case reply := <-pending.responseChan:
+			replies = append(replies, reply)
+			if len(replies) >= pending.expectedCount {
+				return replies, nil
+			}
+		}
+	}
+}
+
+// SendToAndWaitReply sends a request to a specific peer and waits for its response.
+// The context should have a deadline/timeout set to control how long to wait.
+func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data []byte) (*Reply, error) {
+	a.mu.RLock()
+	if !a.running {
+		a.mu.RUnlock()
+		return nil, ErrNotStarted
+	}
+	conn := a.conn
+	a.mu.RUnlock()
+
+	// Generate random request ID
+	requestID := make([]byte, RequestIDSize)
+	if _, err := rand.Read(requestID); err != nil {
+		return nil, fmt.Errorf("failed to generate request ID: %w", err)
+	}
+
+	// Encode as REQUEST message
+	msg := encodeRequestMessage(requestID, data)
+
+	// Encrypt if needed
+	processed, err := a.processOutgoing(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Register pending request
+	reqKey := hex.EncodeToString(requestID)
+	pending := &pendingRequest{
+		responseChan:  make(chan Reply, 1),
+		expectedCount: 1,
+	}
+	a.pendingRequestsMu.Lock()
+	a.pendingRequests[reqKey] = pending
+	a.pendingRequestsMu.Unlock()
+
+	// Cleanup when done
+	defer func() {
+		a.pendingRequestsMu.Lock()
+		delete(a.pendingRequests, reqKey)
+		a.pendingRequestsMu.Unlock()
+	}()
+
+	// Send to peer
+	if _, err := conn.WriteToUDP(processed, addr); err != nil {
+		return nil, err
+	}
+
+	// Wait for response
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case reply := <-pending.responseChan:
+		return &reply, nil
+	}
+}
+
+// Reply sends a response to a request message.
+// This should be called from the message handler when processing a request.
+// Returns an error if the message is not a request.
+func (a *Alan) Reply(msg Message, data []byte) (int, error) {
+	if !msg.IsRequest() {
+		return 0, errors.New("cannot reply to a non-request message")
+	}
+
+	a.mu.RLock()
+	if !a.running {
+		a.mu.RUnlock()
+		return 0, ErrNotStarted
+	}
+	conn := a.conn
+	a.mu.RUnlock()
+
+	// Encode as RESPONSE message with the same request ID
+	respMsg := encodeResponseMessage(msg.requestID, data)
+
+	// Encrypt if needed
+	processed, err := a.processOutgoing(respMsg)
+	if err != nil {
+		return 0, err
+	}
+
+	return conn.WriteToUDP(processed, msg.Addr)
+}
+
 // Peers returns the list of current peer addresses
 func (a *Alan) Peers() []*net.UDPAddr {
 	return a.peers.list()
@@ -532,11 +721,73 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 		handler := a.onMessage
 		a.mu.RUnlock()
 		if handler != nil {
+			// Copy payload to avoid buffer reuse issues when handler runs in goroutine
+			payloadCopy := make([]byte, len(payload))
+			copy(payloadCopy, payload)
+
 			msg := Message{
-				Data: payload,
+				Data: payloadCopy,
 				Addr: sourceAddr,
 			}
 			go handler(a.ctx, msg)
+		}
+
+	case MsgTypeRequest:
+		// Update last seen time for the peer
+		a.peers.updateLastSeen(sourceAddr)
+
+		requestID, data, err := decodeRequestPayload(payload)
+		if err != nil {
+			return
+		}
+
+		a.mu.RLock()
+		handler := a.onMessage
+		a.mu.RUnlock()
+		if handler != nil {
+			// Copy data to avoid buffer reuse issues when handler runs in goroutine
+			dataCopy := make([]byte, len(data))
+			copy(dataCopy, data)
+			requestIDCopy := make([]byte, len(requestID))
+			copy(requestIDCopy, requestID)
+
+			msg := Message{
+				Data:      dataCopy,
+				Addr:      sourceAddr,
+				requestID: requestIDCopy,
+			}
+			go handler(a.ctx, msg)
+		}
+
+	case MsgTypeResponse:
+		// Update last seen time for the peer
+		a.peers.updateLastSeen(sourceAddr)
+
+		requestID, data, err := decodeRequestPayload(payload)
+		if err != nil {
+			return
+		}
+
+		// Route response to the waiting request
+		reqKey := hex.EncodeToString(requestID)
+		a.pendingRequestsMu.RLock()
+		pending, ok := a.pendingRequests[reqKey]
+		a.pendingRequestsMu.RUnlock()
+
+		if ok {
+			// Copy data to avoid buffer reuse issues
+			dataCopy := make([]byte, len(data))
+			copy(dataCopy, data)
+
+			reply := Reply{
+				Data: dataCopy,
+				Addr: sourceAddr,
+			}
+			// Non-blocking send to avoid deadlock if channel is full
+			select {
+			case pending.responseChan <- reply:
+			default:
+			}
 		}
 	}
 }

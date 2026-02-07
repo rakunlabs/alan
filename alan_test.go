@@ -610,3 +610,453 @@ func TestSendTo(t *testing.T) {
 	a1.Stop()
 	a2.Stop()
 }
+
+func TestSendToAndWaitReply(t *testing.T) {
+	const testPort = 15004
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a1 will respond to requests
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {
+			if msg.IsRequest() {
+				// Echo back the data with a prefix
+				a1.Reply(msg, append([]byte("reply:"), msg.Data...))
+			}
+		})
+	}()
+
+	// a2 will send requests
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+
+	// Send request and wait for reply
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer reqCancel()
+
+	reply, err := a2.SendToAndWaitReply(reqCtx, targetAddr, []byte("hello"))
+	if err != nil {
+		t.Fatalf("SendToAndWaitReply failed: %v", err)
+	}
+
+	if !bytes.Equal(reply.Data, []byte("reply:hello")) {
+		t.Errorf("unexpected reply data: %q, want %q", reply.Data, "reply:hello")
+	}
+
+	if !reply.Addr.IP.Equal(net.ParseIP("127.0.0.1")) {
+		t.Errorf("unexpected reply addr: %v", reply.Addr)
+	}
+
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestSendAndWaitReply(t *testing.T) {
+	const testPort1 = 15005
+	const testPort2 = 15015
+	const testPort3 = 15025
+
+	// Create three peers with different ports
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort1,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort2,
+	})
+
+	a3, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort3,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a2 and a3 will respond to requests
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			if msg.IsRequest() {
+				a2.Reply(msg, []byte("from-a2"))
+			}
+		})
+	}()
+
+	go func() {
+		a3.Start(ctx, func(ctx context.Context, msg Message) {
+			if msg.IsRequest() {
+				a3.Reply(msg, []byte("from-a3"))
+			}
+		})
+	}()
+
+	// a1 will broadcast requests
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+	<-a3.Ready()
+
+	// Small delay to ensure all goroutines are ready
+	time.Sleep(50 * time.Millisecond)
+
+	// Add a2 and a3 as peers of a1
+	a1.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort2})
+	a1.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort3})
+
+	// Broadcast request and wait for replies
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer reqCancel()
+
+	replies, err := a1.SendAndWaitReply(reqCtx, []byte("broadcast-request"))
+	if err != nil {
+		t.Fatalf("SendAndWaitReply failed: %v", err)
+	}
+
+	if len(replies) != 2 {
+		t.Fatalf("expected 2 replies, got %d", len(replies))
+	}
+
+	// Check that we got responses from both peers
+	responseData := make(map[string]bool)
+	for _, r := range replies {
+		responseData[string(r.Data)] = true
+	}
+
+	if !responseData["from-a2"] || !responseData["from-a3"] {
+		t.Errorf("missing expected responses: got %v", responseData)
+	}
+
+	a1.Stop()
+	a2.Stop()
+	a3.Stop()
+}
+
+func TestSendAndWaitReply_Timeout(t *testing.T) {
+	const testPort = 15006
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a2 will NOT respond to requests (simulating unresponsive peer)
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			// Intentionally not replying
+		})
+	}()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Add a2 as peer of a1
+	a1.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort})
+
+	// Broadcast request with short timeout
+	reqCtx, reqCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer reqCancel()
+
+	replies, err := a1.SendAndWaitReply(reqCtx, []byte("request"))
+
+	// Should return with context deadline exceeded and empty replies
+	if err != context.DeadlineExceeded {
+		t.Errorf("expected context.DeadlineExceeded, got %v", err)
+	}
+
+	if len(replies) != 0 {
+		t.Errorf("expected 0 replies, got %d", len(replies))
+	}
+
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestSendAndWaitReply_PartialResponses(t *testing.T) {
+	const testPort = 15007
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+	})
+
+	a3, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.3",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Only a2 responds, a3 does not
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {
+			if msg.IsRequest() {
+				a2.Reply(msg, []byte("from-a2"))
+			}
+		})
+	}()
+
+	go func() {
+		a3.Start(ctx, func(ctx context.Context, msg Message) {
+			// Intentionally not replying
+		})
+	}()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+	<-a3.Ready()
+
+	// Add both as peers
+	a1.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort})
+	a1.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.3"), Port: testPort})
+
+	// Broadcast request with short timeout
+	reqCtx, reqCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer reqCancel()
+
+	replies, err := a1.SendAndWaitReply(reqCtx, []byte("request"))
+
+	// Should timeout but return partial responses
+	if err != context.DeadlineExceeded {
+		t.Errorf("expected context.DeadlineExceeded, got %v", err)
+	}
+
+	if len(replies) != 1 {
+		t.Fatalf("expected 1 reply, got %d", len(replies))
+	}
+
+	if !bytes.Equal(replies[0].Data, []byte("from-a2")) {
+		t.Errorf("unexpected reply data: %q", replies[0].Data)
+	}
+
+	a1.Stop()
+	a2.Stop()
+	a3.Stop()
+}
+
+func TestSendToAndWaitReply_Encrypted(t *testing.T) {
+	const testPort = 15008
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Security: &SecurityConfig{
+			Key:     testKey,
+			Enabled: true,
+		},
+	})
+
+	a2, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+		Security: &SecurityConfig{
+			Key:     testKey,
+			Enabled: true,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {
+			if msg.IsRequest() {
+				a1.Reply(msg, append([]byte("encrypted-reply:"), msg.Data...))
+			}
+		})
+	}()
+
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer reqCancel()
+
+	reply, err := a2.SendToAndWaitReply(reqCtx, targetAddr, []byte("secret"))
+	if err != nil {
+		t.Fatalf("SendToAndWaitReply failed: %v", err)
+	}
+
+	if !bytes.Equal(reply.Data, []byte("encrypted-reply:secret")) {
+		t.Errorf("unexpected reply data: %q", reply.Data)
+	}
+
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestIsRequest(t *testing.T) {
+	// Message without request ID
+	msg1 := Message{
+		Data: []byte("test"),
+		Addr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5000},
+	}
+	if msg1.IsRequest() {
+		t.Error("expected IsRequest() to be false for regular message")
+	}
+
+	// Message with request ID
+	msg2 := Message{
+		Data:      []byte("test"),
+		Addr:      &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5000},
+		requestID: make([]byte, 16),
+	}
+	if !msg2.IsRequest() {
+		t.Error("expected IsRequest() to be true for request message")
+	}
+}
+
+func TestReplyToNonRequest(t *testing.T) {
+	const testPort = 15009
+
+	a1, _ := New(Config{
+		DNSAddr:  "localhost",
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// Try to reply to a non-request message
+	msg := Message{
+		Data: []byte("test"),
+		Addr: &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort},
+	}
+
+	_, err := a1.Reply(msg, []byte("response"))
+	if err == nil {
+		t.Error("expected error when replying to non-request message")
+	}
+
+	a1.Stop()
+}
+
+func TestRequestResponseProtocol(t *testing.T) {
+	t.Run("encode/decode request", func(t *testing.T) {
+		requestID := []byte("0123456789abcdef") // 16 bytes
+		data := []byte("request data")
+
+		msg := encodeRequestMessage(requestID, data)
+
+		if msg[0] != MsgTypeRequest {
+			t.Errorf("expected type %d, got %d", MsgTypeRequest, msg[0])
+		}
+
+		msgType, payload, err := decodeMessage(msg)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if msgType != MsgTypeRequest {
+			t.Errorf("expected type %d, got %d", MsgTypeRequest, msgType)
+		}
+
+		decodedReqID, decodedData, err := decodeRequestPayload(payload)
+		if err != nil {
+			t.Fatalf("decode request payload failed: %v", err)
+		}
+		if !bytes.Equal(decodedReqID, requestID) {
+			t.Errorf("request ID mismatch: got %q, want %q", decodedReqID, requestID)
+		}
+		if !bytes.Equal(decodedData, data) {
+			t.Errorf("data mismatch: got %q, want %q", decodedData, data)
+		}
+	})
+
+	t.Run("encode/decode response", func(t *testing.T) {
+		requestID := []byte("fedcba9876543210") // 16 bytes
+		data := []byte("response data")
+
+		msg := encodeResponseMessage(requestID, data)
+
+		if msg[0] != MsgTypeResponse {
+			t.Errorf("expected type %d, got %d", MsgTypeResponse, msg[0])
+		}
+
+		msgType, payload, err := decodeMessage(msg)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if msgType != MsgTypeResponse {
+			t.Errorf("expected type %d, got %d", MsgTypeResponse, msgType)
+		}
+
+		decodedReqID, decodedData, err := decodeRequestPayload(payload)
+		if err != nil {
+			t.Fatalf("decode request payload failed: %v", err)
+		}
+		if !bytes.Equal(decodedReqID, requestID) {
+			t.Errorf("request ID mismatch: got %q, want %q", decodedReqID, requestID)
+		}
+		if !bytes.Equal(decodedData, data) {
+			t.Errorf("data mismatch: got %q, want %q", decodedData, data)
+		}
+	})
+}
