@@ -13,6 +13,7 @@ UDP peer discovery and communication library for Go with optional ChaCha20-Poly1
 - **DNS-based peer discovery** - Resolve a DNS name to discover cluster members
 - **Automatic membership** - JOIN/LEAVE/HEARTBEAT protocol for peer tracking
 - **Encrypted communication** - Optional ChaCha20-Poly1305 authenticated encryption
+- **Request-Reply pattern** - Send requests and wait for responses from peers
 - **Simple API** - `Start()`, `Send()`, `Stop()` - that's it
 - **Callbacks** - Get notified when peers join or leave
 - **Auto-refresh** - Optionally re-resolve DNS to discover new peers
@@ -89,6 +90,62 @@ a, err := alan.New(alan.Config{
 
 All messages (including membership protocol) are automatically encrypted.
 
+## Request-Reply Pattern
+
+Alan supports a request-reply pattern for scenarios where you need responses from peers:
+
+### Send to All Peers and Collect Responses
+
+```go
+// Broadcast request to all peers and wait for their responses
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+replies, err := a.SendAndWaitReply(ctx, []byte("status-request"))
+if err != nil && err != context.DeadlineExceeded {
+    log.Fatal(err)
+}
+
+for _, reply := range replies {
+    fmt.Printf("Response from %s: %s\n", reply.Addr, reply.Data)
+}
+```
+
+### Send to Specific Peer and Wait for Response
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+reply, err := a.SendToAndWaitReply(ctx, peerAddr, []byte("ping"))
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Got response: %s\n", reply.Data)
+```
+
+### Handling Requests (Responder Side)
+
+```go
+a.Start(ctx, func(ctx context.Context, msg alan.Message) {
+    if msg.IsRequest() {
+        // This is a request expecting a reply
+        response := processRequest(msg.Data)
+        a.Reply(msg, response)
+    } else {
+        // Regular fire-and-forget message
+        handleMessage(msg.Data)
+    }
+})
+```
+
+### Notes on Request-Reply
+
+- Use context with timeout/deadline to control how long to wait for responses
+- `SendAndWaitReply` returns all responses received before the context is done
+- Partial responses are returned even if some peers don't respond (with `context.DeadlineExceeded` error)
+- The request ID correlation is handled automatically by the library
+
 ## Configuration
 
 ```go
@@ -151,6 +208,8 @@ The library uses a simple internal protocol:
 | LEAVE | Announce graceful departure |
 | HEARTBEAT | Periodic keepalive |
 | DATA | User data message |
+| REQUEST | Request message expecting a response |
+| RESPONSE | Response to a request message |
 
 - **JOIN**: Sent on startup to all known peers
 - **HEARTBEAT**: Sent every `HeartbeatInterval` to all peers
@@ -178,6 +237,9 @@ When encryption is enabled:
 | `Stop()` | Gracefully stop and notify peers |
 | `Send(data)` | Send data to all peers |
 | `SendTo(addr, data)` | Send data to a specific peer |
+| `SendAndWaitReply(ctx, data)` | Send request to all peers and wait for responses |
+| `SendToAndWaitReply(ctx, addr, data)` | Send request to specific peer and wait for response |
+| `Reply(msg, data)` | Send response to a request message |
 | `Peers()` | Get list of current peer addresses |
 | `PeerCount()` | Get number of connected peers |
 | `Refresh()` | Manually re-resolve DNS |
@@ -193,6 +255,15 @@ When encryption is enabled:
 type Message struct {
     Data []byte       // Decrypted payload
     Addr *net.UDPAddr // Sender's address
+}
+
+// Check if message is a request expecting a reply
+func (m Message) IsRequest() bool
+
+// Reply received from a peer (for request-reply pattern)
+type Reply struct {
+    Data []byte       // Response payload
+    Addr *net.UDPAddr // Responder's address
 }
 
 // Result of sending to a peer
