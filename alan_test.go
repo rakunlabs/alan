@@ -396,10 +396,10 @@ func TestTwoPeers(t *testing.T) {
 	a2.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort})
 
 	// Send from a1 to all peers (which includes a2)
-	a1.Send([]byte("Hello from a1"))
+	a1.Send(ctx, []byte("Hello from a1"))
 
 	// Send from a2 to all peers (which includes a1)
-	a2.Send([]byte("Hello from a2"))
+	a2.Send(ctx, []byte("Hello from a2"))
 
 	// Wait for messages
 	msgWg.Wait()
@@ -477,7 +477,7 @@ func TestTwoPeers_Encrypted(t *testing.T) {
 	a2.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort})
 
 	// Send encrypted message
-	a2.Send([]byte("Secret message!"))
+	a2.Send(ctx, []byte("Secret message!"))
 
 	msgWg.Wait()
 
@@ -1654,4 +1654,748 @@ func TestPeerEventOrdering(t *testing.T) {
 	}
 
 	a1.Stop()
+}
+
+// ============================================================================
+// Quorum Tests
+// ============================================================================
+
+func TestQuorumSize(t *testing.T) {
+	tests := []struct {
+		quorum   int
+		expected int
+	}{
+		{0, 0}, // disabled
+		{1, 1}, // (1/2)+1 = 1
+		{2, 2}, // (2/2)+1 = 2
+		{3, 2}, // (3/2)+1 = 2
+		{4, 3}, // (4/2)+1 = 3
+		{5, 3}, // (5/2)+1 = 3
+		{6, 4}, // (6/2)+1 = 4
+		{7, 4}, // (7/2)+1 = 4
+	}
+
+	for _, tc := range tests {
+		a, _ := New(Config{Port: 0, Quorum: tc.quorum})
+		got := a.QuorumSize()
+		if got != tc.expected {
+			t.Errorf("QuorumSize() with Quorum=%d: got %d, want %d", tc.quorum, got, tc.expected)
+		}
+	}
+}
+
+func TestHasQuorum_Disabled(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 0})
+
+	// With quorum disabled, HasQuorum should always return true
+	if !a.HasQuorum() {
+		t.Error("HasQuorum() should return true when quorum is disabled")
+	}
+}
+
+func TestHasQuorum_NotMet(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 3})
+
+	// With Quorum=3, we need (3/2)+1 = 2 peers
+	// With 0 peers, quorum should not be met
+	if a.HasQuorum() {
+		t.Error("HasQuorum() should return false with 0 peers and Quorum=3")
+	}
+
+	// Add 1 peer, still not enough
+	a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5000})
+	if a.HasQuorum() {
+		t.Error("HasQuorum() should return false with 1 peer and Quorum=3")
+	}
+}
+
+func TestHasQuorum_Met(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 3})
+
+	// Add 2 peers to meet quorum (need (3/2)+1 = 2)
+	a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5000})
+	a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.3"), Port: 5000})
+
+	if !a.HasQuorum() {
+		t.Error("HasQuorum() should return true with 2 peers and Quorum=3")
+	}
+}
+
+func TestWaitForQuorum_Disabled(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 0})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Should return immediately when quorum is disabled
+	err := a.WaitForQuorum(ctx)
+	if err != nil {
+		t.Errorf("WaitForQuorum() should return nil when disabled, got %v", err)
+	}
+}
+
+func TestWaitForQuorum_AlreadyMet(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 3})
+
+	// Add enough peers
+	a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5000})
+	a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.3"), Port: 5000})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := a.WaitForQuorum(ctx)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("WaitForQuorum() returned error: %v", err)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("WaitForQuorum() took too long: %v", elapsed)
+	}
+}
+
+func TestWaitForQuorum_WaitsUntilMet(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 3})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Add peers in background after a delay
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5000})
+		time.Sleep(100 * time.Millisecond)
+		a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.3"), Port: 5000})
+	}()
+
+	start := time.Now()
+	err := a.WaitForQuorum(ctx)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("WaitForQuorum() returned error: %v", err)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("WaitForQuorum() returned too quickly: %v", elapsed)
+	}
+}
+
+func TestWaitForQuorum_ContextCancelled(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 5})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Don't add any peers - quorum will never be met
+	err := a.WaitForQuorum(ctx)
+	if err != context.DeadlineExceeded {
+		t.Errorf("WaitForQuorum() should return DeadlineExceeded, got %v", err)
+	}
+}
+
+// ============================================================================
+// Lock Tests
+// ============================================================================
+
+func TestLock_SinglePeer_NoQuorum(t *testing.T) {
+	const testPort = 16001
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0, // Quorum disabled
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// With no peers and quorum disabled, lock should succeed immediately
+	lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+	defer lockCancel()
+
+	err := a1.Lock(lockCtx, "test-key")
+	if err != nil {
+		t.Fatalf("Lock() failed: %v", err)
+	}
+
+	// Unlock should succeed
+	err = a1.Unlock("test-key")
+	if err != nil {
+		t.Errorf("Unlock() failed: %v", err)
+	}
+
+	a1.Stop()
+}
+
+func TestLock_TwoPeers(t *testing.T) {
+	const testPort = 16002
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	a2, _ := New(Config{
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Connect peers
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+	a1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+	a1.peers.add(a2Addr)
+	a2.peers.add(a1Addr)
+
+	// a1 acquires lock
+	lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+	defer lockCancel()
+
+	err := a1.Lock(lockCtx, "shared-key")
+	if err != nil {
+		t.Fatalf("a1.Lock() failed: %v", err)
+	}
+
+	// a1 unlocks
+	err = a1.Unlock("shared-key")
+	if err != nil {
+		t.Errorf("a1.Unlock() failed: %v", err)
+	}
+
+	// Now a2 should be able to acquire the lock
+	lockCtx2, lockCancel2 := context.WithTimeout(ctx, time.Second)
+	defer lockCancel2()
+
+	err = a2.Lock(lockCtx2, "shared-key")
+	if err != nil {
+		t.Fatalf("a2.Lock() failed after a1 unlocked: %v", err)
+	}
+
+	a2.Unlock("shared-key")
+
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestLock_Contention(t *testing.T) {
+	const testPort = 16003
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	a2, _ := New(Config{
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Connect peers
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+	a1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+	a1.peers.add(a2Addr)
+	a2.peers.add(a1Addr)
+
+	// a1 acquires lock first
+	lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+	err := a1.Lock(lockCtx, "contested-key")
+	lockCancel()
+	if err != nil {
+		t.Fatalf("a1.Lock() failed: %v", err)
+	}
+
+	// a2 tries to acquire same lock with short timeout - should fail/timeout
+	lockCtx2, lockCancel2 := context.WithTimeout(ctx, 200*time.Millisecond)
+	err = a2.Lock(lockCtx2, "contested-key")
+	lockCancel2()
+
+	if err == nil {
+		t.Error("a2.Lock() should have timed out while a1 holds lock")
+		a2.Unlock("contested-key")
+	} else if err != context.DeadlineExceeded {
+		t.Errorf("expected DeadlineExceeded, got %v", err)
+	}
+
+	// a1 releases lock
+	a1.Unlock("contested-key")
+
+	// Now a2 should be able to acquire
+	lockCtx3, lockCancel3 := context.WithTimeout(ctx, time.Second)
+	err = a2.Lock(lockCtx3, "contested-key")
+	lockCancel3()
+	if err != nil {
+		t.Fatalf("a2.Lock() failed after a1 released: %v", err)
+	}
+
+	a2.Unlock("contested-key")
+
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestTryLock_Success(t *testing.T) {
+	const testPort = 16004
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// TryLock on free lock should succeed
+	if !a1.TryLock("trylock-key") {
+		t.Error("TryLock() should succeed on free lock")
+	}
+
+	a1.Unlock("trylock-key")
+	a1.Stop()
+}
+
+func TestTryLock_Failure(t *testing.T) {
+	const testPort = 16005
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	a2, _ := New(Config{
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Connect peers
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+	a1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+	a1.peers.add(a2Addr)
+	a2.peers.add(a1Addr)
+
+	// a1 acquires lock
+	lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+	a1.Lock(lockCtx, "trylock-fail")
+	lockCancel()
+
+	// a2's TryLock should fail
+	if a2.TryLock("trylock-fail") {
+		t.Error("TryLock() should fail when lock is held by another peer")
+		a2.Unlock("trylock-fail")
+	}
+
+	a1.Unlock("trylock-fail")
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestTryLock_NoQuorum(t *testing.T) {
+	a, _ := New(Config{Port: 0, Quorum: 5})
+
+	// With Quorum=5, we need 3 peers, but we have 0
+	// TryLock should return false
+	if a.TryLock("no-quorum-key") {
+		t.Error("TryLock() should return false when quorum not met")
+	}
+}
+
+func TestUnlock_NotHeld(t *testing.T) {
+	const testPort = 16006
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// Try to unlock a lock we don't hold
+	err := a1.Unlock("not-held-key")
+	if !errors.Is(err, ErrLockNotHeld) {
+		t.Errorf("Unlock() should return ErrLockNotHeld, got %v", err)
+	}
+
+	a1.Stop()
+}
+
+func TestLock_AutoRelease(t *testing.T) {
+	const testPort = 16007
+
+	a1, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              testPort,
+		Quorum:            0,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	a2, _ := New(Config{
+		BindAddr:          "127.0.0.2",
+		Port:              testPort,
+		Quorum:            0,
+		HeartbeatInterval: 50 * time.Millisecond,
+		HeartbeatTimeout:  150 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Connect peers
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+	a1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+	a1.peers.add(a2Addr)
+	a2.peers.add(a1Addr)
+
+	// a2 acquires lock
+	lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+	err := a2.Lock(lockCtx, "auto-release-key")
+	lockCancel()
+	if err != nil {
+		t.Fatalf("a2.Lock() failed: %v", err)
+	}
+
+	// a2 stops without unlocking
+	a2.Stop()
+
+	// Wait for a1 to detect a2 left
+	time.Sleep(300 * time.Millisecond)
+
+	// a1 should now be able to acquire the lock
+	lockCtx2, lockCancel2 := context.WithTimeout(ctx, time.Second)
+	err = a1.Lock(lockCtx2, "auto-release-key")
+	lockCancel2()
+	if err != nil {
+		t.Fatalf("a1.Lock() failed after a2 disconnected: %v", err)
+	}
+
+	a1.Unlock("auto-release-key")
+	a1.Stop()
+}
+
+func TestLock_ContextCancellation(t *testing.T) {
+	const testPort = 16008
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	a2, _ := New(Config{
+		BindAddr: "127.0.0.2",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	go func() {
+		a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+	<-a2.Ready()
+
+	// Connect peers
+	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort}
+	a1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort}
+	a1.peers.add(a2Addr)
+	a2.peers.add(a1Addr)
+
+	// a1 acquires lock
+	lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+	a1.Lock(lockCtx, "cancel-key")
+	lockCancel()
+
+	// a2 tries to acquire with cancellable context
+	lockCtx2, lockCancel2 := context.WithCancel(ctx)
+
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- a2.Lock(lockCtx2, "cancel-key")
+	}()
+
+	// Cancel while waiting
+	time.Sleep(50 * time.Millisecond)
+	lockCancel2()
+
+	select {
+	case err := <-resultCh:
+		if err != context.Canceled {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Lock() didn't return after context cancelled")
+	}
+
+	a1.Unlock("cancel-key")
+	a1.Stop()
+	a2.Stop()
+}
+
+func TestLock_MultipleKeys(t *testing.T) {
+	const testPort = 16009
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   0,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// Acquire multiple independent locks
+	keys := []string{"key-a", "key-b", "key-c"}
+
+	for _, key := range keys {
+		lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+		err := a1.Lock(lockCtx, key)
+		lockCancel()
+		if err != nil {
+			t.Fatalf("Lock(%s) failed: %v", key, err)
+		}
+	}
+
+	// All should be held
+	a1.locksMu.Lock()
+	heldCount := len(a1.locks)
+	a1.locksMu.Unlock()
+
+	if heldCount != len(keys) {
+		t.Errorf("expected %d locks held, got %d", len(keys), heldCount)
+	}
+
+	// Unlock all
+	for _, key := range keys {
+		err := a1.Unlock(key)
+		if err != nil {
+			t.Errorf("Unlock(%s) failed: %v", key, err)
+		}
+	}
+
+	a1.Stop()
+}
+
+func TestLock_WaitsForQuorum(t *testing.T) {
+	const testPort = 16010
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   3, // Need (3/2)+1 = 2 peers
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// Try to lock without quorum - should block
+	lockCtx, lockCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	err := a1.Lock(lockCtx, "quorum-key")
+	lockCancel()
+
+	if err != context.DeadlineExceeded {
+		t.Errorf("Lock() should timeout waiting for quorum, got %v", err)
+	}
+
+	a1.Stop()
+}
+
+func TestSend_WaitsForQuorum(t *testing.T) {
+	const testPort = 16011
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   3, // Need 2 peers
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// Send without quorum should timeout
+	sendCtx, sendCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	results := a1.Send(sendCtx, []byte("test"))
+	sendCancel()
+
+	if len(results) == 0 {
+		t.Fatal("expected at least one result with error")
+	}
+
+	if results[0].Error != context.DeadlineExceeded {
+		t.Errorf("expected DeadlineExceeded, got %v", results[0].Error)
+	}
+
+	a1.Stop()
+}
+
+func TestSendAndWaitReply_WaitsForQuorum(t *testing.T) {
+	const testPort = 16012
+
+	a1, _ := New(Config{
+		BindAddr: "127.0.0.1",
+		Port:     testPort,
+		Quorum:   3, // Need 2 peers
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	}()
+
+	<-a1.Ready()
+
+	// SendAndWaitReply without quorum should timeout
+	sendCtx, sendCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	_, err := a1.SendAndWaitReply(sendCtx, []byte("test"))
+	sendCancel()
+
+	if err != context.DeadlineExceeded {
+		t.Errorf("expected DeadlineExceeded, got %v", err)
+	}
+
+	a1.Stop()
+}
+
+func TestLockProtocol_EncodeDecodec(t *testing.T) {
+	requestID := []byte("0123456789abcdef") // 16 bytes
+	key := "my-lock-key"
+
+	// Test LockRequest encoding
+	msg := encodeLockMessage(MsgTypeLockRequest, requestID, key)
+	if msg[0] != MsgTypeLockRequest {
+		t.Errorf("expected type %d, got %d", MsgTypeLockRequest, msg[0])
+	}
+
+	msgType, payload, err := decodeMessage(msg)
+	if err != nil {
+		t.Fatalf("decodeMessage failed: %v", err)
+	}
+	if msgType != MsgTypeLockRequest {
+		t.Errorf("expected type %d, got %d", MsgTypeLockRequest, msgType)
+	}
+
+	decodedReqID, decodedKey, err := decodeLockPayload(payload)
+	if err != nil {
+		t.Fatalf("decodeLockPayload failed: %v", err)
+	}
+	if !bytes.Equal(decodedReqID, requestID) {
+		t.Errorf("request ID mismatch: got %q, want %q", decodedReqID, requestID)
+	}
+	if decodedKey != key {
+		t.Errorf("key mismatch: got %q, want %q", decodedKey, key)
+	}
+
+	// Test other message types
+	for _, msgType := range []byte{MsgTypeLockGrant, MsgTypeLockDeny, MsgTypeLockRelease} {
+		msg := encodeLockMessage(msgType, requestID, key)
+		if msg[0] != msgType {
+			t.Errorf("expected type %d, got %d", msgType, msg[0])
+		}
+	}
 }

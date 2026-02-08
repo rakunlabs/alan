@@ -14,6 +14,8 @@ UDP peer discovery and communication library for Go with optional ChaCha20-Poly1
 - **Automatic membership** - JOIN/LEAVE/HEARTBEAT protocol for peer tracking
 - **Encrypted communication** - Optional ChaCha20-Poly1305 authenticated encryption
 - **Request-Reply pattern** - Send requests and wait for responses from peers
+- **Distributed locking** - Named locks with automatic release on peer disconnect
+- **Quorum support** - Configurable quorum requirement for distributed operations
 - **Simple API** - `Start()`, `Send()`, `Stop()` - that's it
 - **Callbacks** - Get notified when peers join or leave
 - **Auto-refresh** - Optionally re-resolve DNS to discover new peers
@@ -64,10 +66,10 @@ func main() {
         })
     }()
 
-    // Send to all peers
-    a.Send([]byte("Hello everyone!"))
+    // Send to all peers (waits for quorum if configured)
+    a.Send(ctx, []byte("Hello everyone!"))
 
-    // Send to specific peer
+    // Send to specific peer (direct send, no quorum check)
     a.SendTo(specificAddr, []byte("Hello you!"))
 
     // Graceful shutdown
@@ -148,6 +150,117 @@ a.Start(ctx, func(ctx context.Context, msg alan.Message) {
 - **No infinite waits**: Because peer disconnects are detected via the membership protocol, requests won't wait forever for unresponsive peers
 - The request ID correlation is handled automatically by the library
 
+## Distributed Locking
+
+Alan provides distributed named locks for coordinating work across peers:
+
+### Basic Lock Usage
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+// Acquire a named lock (blocks until acquired or context cancelled)
+err := a.Lock(ctx, "my-job")
+if err != nil {
+    log.Fatal("failed to acquire lock:", err)
+}
+
+// Do protected work...
+doExclusiveWork()
+
+// Release the lock
+err = a.Unlock("my-job")
+if err != nil {
+    log.Fatal("failed to release lock:", err)
+}
+```
+
+### TryLock (Non-blocking)
+
+```go
+// Try to acquire lock without blocking
+if a.TryLock("my-job") {
+    // Got the lock
+    defer a.Unlock("my-job")
+    doWork()
+} else {
+    // Lock is held by another peer
+    log.Println("could not acquire lock")
+}
+```
+
+### Lock Features
+
+- **Named locks**: Multiple independent locks identified by key
+- **Auto-release**: Locks are automatically released when the holder disconnects
+- **Quorum-aware**: When quorum is enabled, `Lock()` waits for quorum before acquiring
+- **Context support**: `Lock()` respects context cancellation and deadlines
+
+### Lock Limitations
+
+The distributed lock provides **best-effort coordination**, not strong consistency:
+
+- **Split-brain possible**: During network partitions, multiple peers might acquire the same lock
+- **No fencing tokens**: There's no mechanism to prove lock ownership to external systems
+- **Startup race**: If peers start simultaneously before discovering each other, both might acquire a lock
+
+Use quorum configuration to mitigate the startup race condition.
+
+## Quorum
+
+Quorum ensures operations only proceed when enough peers are present in the cluster:
+
+### Configuration
+
+```go
+a, err := alan.New(alan.Config{
+    DNSAddr: "my-cluster.local",
+    Port:    5000,
+    Quorum:  3, // Expected cluster size
+})
+```
+
+With `Quorum: 3`, operations require `(3/2)+1 = 2` peers to be present.
+
+| Quorum Setting | Required Peers |
+|----------------|----------------|
+| 0 (default)    | Disabled       |
+| 1              | 1              |
+| 2              | 2              |
+| 3              | 2              |
+| 4              | 3              |
+| 5              | 3              |
+
+### Quorum-Aware Operations
+
+| Operation | Quorum Behavior |
+|-----------|-----------------|
+| `Lock(ctx, key)` | Waits for quorum, then acquires lock |
+| `TryLock(key)` | Returns `false` if quorum not met |
+| `Send(ctx, data)` | Waits for quorum, then broadcasts |
+| `SendAndWaitReply(ctx, data)` | Waits for quorum, then broadcasts |
+| `SendTo(addr, data)` | No quorum check (direct send) |
+
+### Checking Quorum Status
+
+```go
+// Check if quorum is currently met
+if a.HasQuorum() {
+    // Safe to proceed
+}
+
+// Get required peer count
+required := a.QuorumSize() // Returns (Quorum/2)+1
+
+// Wait for quorum before starting work
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := a.WaitForQuorum(ctx); err != nil {
+    log.Fatal("cluster not ready:", err)
+}
+```
+
 ## Configuration
 
 ```go
@@ -184,6 +297,10 @@ type Config struct {
     // When the queue is full, the listener blocks until space is available.
     MessageQueueSize int
     
+    // Quorum - expected cluster size for distributed operations (default: 0 = disabled)
+    // When set, operations like Lock() and SendCtx() wait until (Quorum/2)+1 peers are present
+    Quorum int
+    
     // Security for encryption (optional)
     Security *SecurityConfig
 }
@@ -218,6 +335,10 @@ The library uses a simple internal protocol:
 | DATA | User data message |
 | REQUEST | Request message expecting a response |
 | RESPONSE | Response to a request message |
+| LOCK_REQUEST | Request to acquire a distributed lock |
+| LOCK_GRANT | Grant lock to requester |
+| LOCK_DENY | Deny lock (already held) |
+| LOCK_RELEASE | Notify lock has been released |
 
 - **JOIN**: Sent on startup to all known peers
 - **HEARTBEAT**: Sent every `HeartbeatInterval` to all peers
@@ -263,11 +384,17 @@ When encryption is enabled:
 | `OnPeerLeave(handler)` | Set callback for peer leave events |
 | `Start(ctx, handler)` | Start the peer discovery system (blocking) |
 | `Stop()` | Gracefully stop and notify peers |
-| `Send(data)` | Send data to all peers |
-| `SendTo(addr, data)` | Send data to a specific peer |
+| `Send(ctx, data)` | Send data to all peers (waits for quorum if enabled) |
+| `SendTo(addr, data)` | Send data to a specific peer (no quorum check) |
 | `SendAndWaitReply(ctx, data)` | Send request to all peers and wait for responses |
 | `SendToAndWaitReply(ctx, addr, data)` | Send request to specific peer and wait for response |
 | `Reply(msg, data)` | Send response to a request message |
+| `Lock(ctx, key)` | Acquire a distributed lock (blocking) |
+| `TryLock(key)` | Try to acquire a lock (non-blocking) |
+| `Unlock(key)` | Release a distributed lock |
+| `HasQuorum()` | Check if quorum is currently met |
+| `WaitForQuorum(ctx)` | Block until quorum is reached |
+| `QuorumSize()` | Get required peer count for quorum |
 | `Peers()` | Get list of current peer addresses |
 | `PeerCount()` | Get number of connected peers |
 | `Refresh()` | Manually re-resolve DNS |
@@ -307,6 +434,8 @@ type MessageHandler func(ctx context.Context, msg Message)
 
 // Errors
 var ErrPeerDisconnected = errors.New("peer disconnected before responding")
+var ErrNoQuorum = errors.New("quorum not reached")
+var ErrLockNotHeld = errors.New("lock not held by this instance")
 ```
 
 ## License
