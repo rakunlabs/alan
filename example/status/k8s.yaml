@@ -38,7 +38,7 @@ spec:
   - name: kube
     namespace: kube-gateway
   hostnames:
-  - "alan-status.kube.com"
+  - "alan-status.example.com"
   rules:
   - matches:
     - path:
