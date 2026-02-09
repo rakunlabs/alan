@@ -11,10 +11,6 @@ spec:
       port: 5000
       targetPort: 5000
       protocol: UDP
-    - name: http
-      port: 8080
-      targetPort: 8080
-      protocol: TCP
 ---
 apiVersion: v1
 kind: Service

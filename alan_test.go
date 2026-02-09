@@ -396,10 +396,10 @@ func TestTwoPeers(t *testing.T) {
 	a2.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort})
 
 	// Send from a1 to all peers (which includes a2)
-	a1.Send(ctx, []byte("Hello from a1"))
+	a1.Send([]byte("Hello from a1"))
 
 	// Send from a2 to all peers (which includes a1)
-	a2.Send(ctx, []byte("Hello from a2"))
+	a2.Send([]byte("Hello from a2"))
 
 	// Wait for messages
 	msgWg.Wait()
@@ -477,7 +477,7 @@ func TestTwoPeers_Encrypted(t *testing.T) {
 	a2.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort})
 
 	// Send encrypted message
-	a2.Send(ctx, []byte("Secret message!"))
+	a2.Send([]byte("Secret message!"))
 
 	msgWg.Wait()
 
@@ -1676,7 +1676,7 @@ func TestQuorumSize(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		a, _ := New(Config{Port: 0, Quorum: tc.quorum})
+		a, _ := New(Config{Port: 0, Replicas: tc.quorum})
 		got := a.QuorumSize()
 		if got != tc.expected {
 			t.Errorf("QuorumSize() with Quorum=%d: got %d, want %d", tc.quorum, got, tc.expected)
@@ -1685,7 +1685,7 @@ func TestQuorumSize(t *testing.T) {
 }
 
 func TestHasQuorum_Disabled(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 0})
+	a, _ := New(Config{Port: 0, Replicas: 0})
 
 	// With quorum disabled, HasQuorum should always return true
 	if !a.HasQuorum() {
@@ -1694,7 +1694,7 @@ func TestHasQuorum_Disabled(t *testing.T) {
 }
 
 func TestHasQuorum_NotMet(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 3})
+	a, _ := New(Config{Port: 0, Replicas: 3})
 
 	// With Quorum=3, we need (3/2)+1 = 2 peers
 	// With 0 peers, quorum should not be met
@@ -1710,7 +1710,7 @@ func TestHasQuorum_NotMet(t *testing.T) {
 }
 
 func TestHasQuorum_Met(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 3})
+	a, _ := New(Config{Port: 0, Replicas: 3})
 
 	// Add 2 peers to meet quorum (need (3/2)+1 = 2)
 	a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5000})
@@ -1722,7 +1722,7 @@ func TestHasQuorum_Met(t *testing.T) {
 }
 
 func TestWaitForQuorum_Disabled(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 0})
+	a, _ := New(Config{Port: 0, Replicas: 0})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -1735,7 +1735,7 @@ func TestWaitForQuorum_Disabled(t *testing.T) {
 }
 
 func TestWaitForQuorum_AlreadyMet(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 3})
+	a, _ := New(Config{Port: 0, Replicas: 3})
 
 	// Add enough peers
 	a.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5000})
@@ -1757,7 +1757,7 @@ func TestWaitForQuorum_AlreadyMet(t *testing.T) {
 }
 
 func TestWaitForQuorum_WaitsUntilMet(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 3})
+	a, _ := New(Config{Port: 0, Replicas: 3})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1783,7 +1783,7 @@ func TestWaitForQuorum_WaitsUntilMet(t *testing.T) {
 }
 
 func TestWaitForQuorum_ContextCancelled(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 5})
+	a, _ := New(Config{Port: 0, Replicas: 5})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -1805,7 +1805,7 @@ func TestLock_SinglePeer_NoQuorum(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0, // Quorum disabled
+		Replicas: 0, // Quorum disabled
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1841,13 +1841,13 @@ func TestLock_TwoPeers(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	a2, _ := New(Config{
 		BindAddr: "127.0.0.2",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1906,13 +1906,13 @@ func TestLock_Contention(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	a2, _ := New(Config{
 		BindAddr: "127.0.0.2",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1978,7 +1978,7 @@ func TestTryLock_Success(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2005,13 +2005,13 @@ func TestTryLock_Failure(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	a2, _ := New(Config{
 		BindAddr: "127.0.0.2",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2051,7 +2051,7 @@ func TestTryLock_Failure(t *testing.T) {
 }
 
 func TestTryLock_NoQuorum(t *testing.T) {
-	a, _ := New(Config{Port: 0, Quorum: 5})
+	a, _ := New(Config{Port: 0, Replicas: 5})
 
 	// With Quorum=5, we need 3 peers, but we have 0
 	// TryLock should return false
@@ -2066,7 +2066,7 @@ func TestUnlock_NotHeld(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2093,7 +2093,7 @@ func TestLock_AutoRelease(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr:          "127.0.0.1",
 		Port:              testPort,
-		Quorum:            0,
+		Replicas:          0,
 		HeartbeatInterval: 50 * time.Millisecond,
 		HeartbeatTimeout:  150 * time.Millisecond,
 	})
@@ -2101,7 +2101,7 @@ func TestLock_AutoRelease(t *testing.T) {
 	a2, _ := New(Config{
 		BindAddr:          "127.0.0.2",
 		Port:              testPort,
-		Quorum:            0,
+		Replicas:          0,
 		HeartbeatInterval: 50 * time.Millisecond,
 		HeartbeatTimeout:  150 * time.Millisecond,
 	})
@@ -2158,13 +2158,13 @@ func TestLock_ContextCancellation(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	a2, _ := New(Config{
 		BindAddr: "127.0.0.2",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2224,7 +2224,7 @@ func TestLock_MultipleKeys(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   0,
+		Replicas: 0,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2274,7 +2274,7 @@ func TestLock_WaitsForQuorum(t *testing.T) {
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Quorum:   3, // Need (3/2)+1 = 2 peers
+		Replicas: 3, // Need (3/2)+1 = 2 peers
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2293,70 +2293,6 @@ func TestLock_WaitsForQuorum(t *testing.T) {
 
 	if err != context.DeadlineExceeded {
 		t.Errorf("Lock() should timeout waiting for quorum, got %v", err)
-	}
-
-	a1.Stop()
-}
-
-func TestSend_WaitsForQuorum(t *testing.T) {
-	const testPort = 16011
-
-	a1, _ := New(Config{
-		BindAddr: "127.0.0.1",
-		Port:     testPort,
-		Quorum:   3, // Need 2 peers
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		a1.Start(ctx, func(ctx context.Context, msg Message) {})
-	}()
-
-	<-a1.Ready()
-
-	// Send without quorum should timeout
-	sendCtx, sendCancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	results := a1.Send(sendCtx, []byte("test"))
-	sendCancel()
-
-	if len(results) == 0 {
-		t.Fatal("expected at least one result with error")
-	}
-
-	if results[0].Error != context.DeadlineExceeded {
-		t.Errorf("expected DeadlineExceeded, got %v", results[0].Error)
-	}
-
-	a1.Stop()
-}
-
-func TestSendAndWaitReply_WaitsForQuorum(t *testing.T) {
-	const testPort = 16012
-
-	a1, _ := New(Config{
-		BindAddr: "127.0.0.1",
-		Port:     testPort,
-		Quorum:   3, // Need 2 peers
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		a1.Start(ctx, func(ctx context.Context, msg Message) {})
-	}()
-
-	<-a1.Ready()
-
-	// SendAndWaitReply without quorum should timeout
-	sendCtx, sendCancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	_, err := a1.SendAndWaitReply(sendCtx, []byte("test"))
-	sendCancel()
-
-	if err != context.DeadlineExceeded {
-		t.Errorf("expected DeadlineExceeded, got %v", err)
 	}
 
 	a1.Stop()

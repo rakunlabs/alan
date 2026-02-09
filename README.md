@@ -238,9 +238,6 @@ With `Quorum: 3`, operations require `(3/2)+1 = 2` peers to be present.
 |-----------|-----------------|
 | `Lock(ctx, key)` | Waits for quorum, then acquires lock |
 | `TryLock(key)` | Returns `false` if quorum not met |
-| `Send(ctx, data)` | Waits for quorum, then broadcasts |
-| `SendAndWaitReply(ctx, data)` | Waits for quorum, then broadcasts |
-| `SendTo(addr, data)` | No quorum check (direct send) |
 
 ### Checking Quorum Status
 
