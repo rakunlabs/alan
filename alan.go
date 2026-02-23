@@ -11,12 +11,13 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 var (
-	// ErrInvalidKeySize is returned when the key is not exactly 32 bytes
-	ErrInvalidKeySize = errors.New("key must be exactly 32 bytes")
+	// ErrEmptyKey is returned when the security key is empty
+	ErrEmptyKey = errors.New("security key must not be empty")
 	// ErrSecurityNotEnabled is returned when trying to use encryption without enabling it
 	ErrSecurityNotEnabled = errors.New("security is not enabled")
 	// ErrMessageTooShort is returned when encrypted message is shorter than nonce size
@@ -52,7 +53,7 @@ type Config struct {
 	// BufferSize is the buffer size for receiving messages (default: 4096)
 	BufferSize int `cfg:"buffer_size" json:"buffer_size"`
 	// Security holds optional encryption configuration
-	Security *SecurityConfig `cfg:"security" json:"security"`
+	Security SecurityConfig `cfg:"security" json:"security"`
 	// HeartbeatInterval is how often to send heartbeats (default: 5s)
 	HeartbeatInterval time.Duration `cfg:"heartbeat_interval" json:"heartbeat_interval"`
 	// HeartbeatTimeout is when a peer is considered dead (default: 15s)
@@ -72,9 +73,9 @@ type Config struct {
 
 // SecurityConfig holds encryption settings
 type SecurityConfig struct {
-	// Key is the pre-shared key for ChaCha20-Poly1305 encryption.
-	// Must be exactly 32 bytes.
-	Key []byte `cfg:"key" json:"key"`
+	// Key is the pre-shared key for encryption.
+	// Can be any length; it is derived into a 32-byte key using Argon2id.
+	Key []byte `cfg:"key" json:"key" log:"-"`
 	// Enabled determines whether encryption is active
 	Enabled bool `cfg:"enabled" json:"enabled"`
 }
@@ -243,13 +244,16 @@ func New(config Config) (*Alan, error) {
 	}
 
 	// Initialize encryption if security is enabled
-	if config.Security != nil && config.Security.Enabled {
-		if len(config.Security.Key) != chacha20poly1305.KeySize {
-			return nil, fmt.Errorf("%w: got %d bytes, want %d bytes",
-				ErrInvalidKeySize, len(config.Security.Key), chacha20poly1305.KeySize)
+	if config.Security.Enabled {
+		if len(config.Security.Key) == 0 {
+			return nil, ErrEmptyKey
 		}
 
-		aead, err := chacha20poly1305.NewX(config.Security.Key)
+		// Derive a 32-byte key using Argon2id
+		salt := []byte("github.com/rakunlabs/alan")
+		derivedKey := argon2.IDKey(config.Security.Key, salt, 1, 64*1024, 4, chacha20poly1305.KeySize)
+
+		aead, err := chacha20poly1305.NewX(derivedKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create cipher: %w", err)
 		}

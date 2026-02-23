@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// Test key for encryption (32 bytes)
-var testKey = []byte("12345678901234567890123456789012")
+// Test key for encryption (any length is fine, derived via Argon2id)
+var testKey = []byte("my-secret-key")
 
 func TestNew(t *testing.T) {
 	t.Run("without security", func(t *testing.T) {
@@ -31,7 +31,7 @@ func TestNew(t *testing.T) {
 		a, err := New(Config{
 			DNSAddr: "localhost",
 			Port:    5000,
-			Security: &SecurityConfig{
+			Security: SecurityConfig{
 				Key:     testKey,
 				Enabled: true,
 			},
@@ -44,17 +44,54 @@ func TestNew(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid key size", func(t *testing.T) {
+	t.Run("empty key", func(t *testing.T) {
 		_, err := New(Config{
 			DNSAddr: "localhost",
 			Port:    5000,
-			Security: &SecurityConfig{
-				Key:     []byte("short"),
+			Security: SecurityConfig{
+				Key:     []byte{},
 				Enabled: true,
 			},
 		})
 		if err == nil {
-			t.Error("expected error for invalid key size")
+			t.Error("expected error for empty key")
+		}
+		if !errors.Is(err, ErrEmptyKey) {
+			t.Errorf("expected ErrEmptyKey, got %v", err)
+		}
+	})
+
+	t.Run("short passphrase key", func(t *testing.T) {
+		a, err := New(Config{
+			DNSAddr: "localhost",
+			Port:    5000,
+			Security: SecurityConfig{
+				Key:     []byte("short"),
+				Enabled: true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !a.IsSecure() {
+			t.Error("expected IsSecure() to be true")
+		}
+	})
+
+	t.Run("long passphrase key", func(t *testing.T) {
+		a, err := New(Config{
+			DNSAddr: "localhost",
+			Port:    5000,
+			Security: SecurityConfig{
+				Key:     []byte("this-is-a-very-long-passphrase-that-exceeds-32-bytes-significantly"),
+				Enabled: true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !a.IsSecure() {
+			t.Error("expected IsSecure() to be true")
 		}
 	})
 
@@ -98,7 +135,7 @@ func TestNew(t *testing.T) {
 func TestEncryptDecrypt(t *testing.T) {
 	a, err := New(Config{
 		DNSAddr: "localhost",
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			Key:     testKey,
 			Enabled: true,
 		},
@@ -134,7 +171,7 @@ func TestEncryptDecrypt(t *testing.T) {
 func TestEncryptDecrypt_DifferentNonces(t *testing.T) {
 	a, err := New(Config{
 		DNSAddr: "localhost",
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			Key:     testKey,
 			Enabled: true,
 		},
@@ -158,7 +195,7 @@ func TestEncryptDecrypt_DifferentNonces(t *testing.T) {
 func TestDecrypt_InvalidMessage(t *testing.T) {
 	a, err := New(Config{
 		DNSAddr: "localhost",
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			Key:     testKey,
 			Enabled: true,
 		},
@@ -427,7 +464,7 @@ func TestTwoPeers_Encrypted(t *testing.T) {
 		Port:              testPort,
 		HeartbeatInterval: 1 * time.Second,
 		HeartbeatTimeout:  5 * time.Second,
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			Key:     testKey,
 			Enabled: true,
 		},
@@ -442,7 +479,7 @@ func TestTwoPeers_Encrypted(t *testing.T) {
 		Port:              testPort,
 		HeartbeatInterval: 1 * time.Second,
 		HeartbeatTimeout:  5 * time.Second,
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			Key:     testKey,
 			Enabled: true,
 		},
@@ -895,7 +932,7 @@ func TestSendToAndWaitReply_Encrypted(t *testing.T) {
 		DNSAddr:  "localhost",
 		BindAddr: "127.0.0.1",
 		Port:     testPort,
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			Key:     testKey,
 			Enabled: true,
 		},
@@ -905,7 +942,7 @@ func TestSendToAndWaitReply_Encrypted(t *testing.T) {
 		DNSAddr:  "localhost",
 		BindAddr: "127.0.0.2",
 		Port:     testPort,
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			Key:     testKey,
 			Enabled: true,
 		},

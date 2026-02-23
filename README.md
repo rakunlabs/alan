@@ -84,7 +84,7 @@ a, err := alan.New(alan.Config{
     DNSAddr: "my-cluster.local",
     Port:    5000,
     Security: &alan.SecurityConfig{
-        Key:     []byte("12345678901234567890123456789012"), // 32 bytes
+        Key:     []byte("my-secret-key"), // any length, derived via Argon2id
         Enabled: true,
     },
 })
@@ -303,7 +303,7 @@ type Config struct {
 }
 
 type SecurityConfig struct {
-    // Key must be exactly 32 bytes for ChaCha20-Poly1305
+    // Key can be any length; derived into a 32-byte key using Argon2id
     Key     []byte
     Enabled bool
 }
@@ -367,6 +367,7 @@ Peer join/leave events are also processed in order:
 When encryption is enabled:
 - All messages (JOIN/LEAVE/HEARTBEAT/DATA) are encrypted
 - Uses XChaCha20-Poly1305 (AEAD)
+- Key is derived from the provided passphrase using Argon2id
 - Random 24-byte nonce per message
 - Wire format: `[nonce:24][ciphertext+tag]`
 
