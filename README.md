@@ -77,6 +77,66 @@ func main() {
 }
 ```
 
+## Global Instance
+
+For services that create a single cluster-wide `Alan` instance, you can register
+it as a process-wide default and access it from any package without passing the
+handle around. This follows the same pattern as `slog.Default` / `slog.SetDefault`.
+
+### Register at startup
+
+```go
+func main() {
+    a, err := alan.New(alan.Config{DNSAddr: "my-cluster.local", Port: 5000})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    go a.Start(ctx, handleMessage)
+
+    // Register as the process-wide default
+    alan.SetDefault(a)
+
+    // ... run your service ...
+}
+```
+
+### Use from any package
+
+```go
+package worker
+
+import "github.com/rakunlabs/alan"
+
+func Notify(data []byte) error {
+    a, err := alan.Default()
+    if err != nil {
+        return err // no default registered yet
+    }
+    a.Send(data)
+    return nil
+}
+```
+
+### API
+
+| Function | Description |
+|----------|-------------|
+| `SetDefault(*Alan)` | Register the global instance (pass `nil` to clear) |
+| `Default() (*Alan, error)` | Get the instance; returns `ErrNoDefault` if none set |
+| `MustDefault() *Alan` | Get the instance; panics if none set |
+| `HasDefault() bool` | Check whether a default is registered |
+
+Internally uses `atomic.Pointer[Alan]`, so `Default()` / `MustDefault()` are
+lock-free on the hot path and `SetDefault()` is safe from any goroutine.
+
+> **When not to use this:** if a single process needs to join two clusters
+> (two `Alan` instances), prefer passing `*Alan` as a dependency. The global
+> is a convenience for the common single-cluster case.
+
 ## With Encryption
 
 ```go
@@ -206,6 +266,83 @@ The distributed lock provides **best-effort coordination**, not strong consisten
 - **Startup race**: If peers start simultaneously before discovering each other, both might acquire a lock
 
 Use quorum configuration to mitigate the startup race condition.
+
+### Leader Election Helpers
+
+For the common pattern "only one instance in the cluster should run this
+long-running task", Alan provides two wrappers around `Lock`/`Unlock`.
+
+#### RunAsLeader
+
+```go
+err := a.RunAsLeader(ctx, "scheduler", func(ctx context.Context) error {
+    if err := scheduler.Start(ctx); err != nil {
+        return err
+    }
+    defer scheduler.Stop()
+    <-ctx.Done() // hold leadership until shutdown
+    return ctx.Err()
+})
+```
+
+Blocks inside the acquire until this instance becomes leader, runs `fn`,
+and releases the lock when `fn` returns or `ctx` is cancelled. Other
+instances in the cluster block in their own `RunAsLeader` call until the
+current leader releases (via `Unlock`, `fn` returning, or heartbeat timeout
+if the leader crashes).
+
+This replaces hand-rolled leader loops like:
+
+```go
+// Before: manual retry / hold / release
+for {
+    if err := a.Lock(ctx, "scheduler"); err != nil {
+        if ctx.Err() != nil { return }
+        time.Sleep(5 * time.Second)
+        continue
+    }
+    startWork()
+    <-ctx.Done()
+    stopWork()
+    a.Unlock("scheduler")
+    return
+}
+
+// After:
+a.RunAsLeader(ctx, "scheduler", func(ctx context.Context) error {
+    startWork()
+    defer stopWork()
+    <-ctx.Done()
+    return ctx.Err()
+})
+```
+
+#### LeaderLoop
+
+Same as `RunAsLeader` but re-acquires if `fn` exits before `ctx` is cancelled:
+
+```go
+err := a.LeaderLoop(ctx, "scheduler", 5*time.Second,
+    func(ctx context.Context) error {
+        return runCron(ctx) // if this returns, helper retries after 5s
+    })
+```
+
+Useful when `fn` might exit unexpectedly but you still want the service to
+retain leader semantics across the cluster. Errors returned by `fn` are
+discarded by the loop — handle them inside `fn` (log, metrics, etc.) if
+you need them. `LeaderLoop` itself returns only when `ctx` is cancelled,
+and always returns `ctx.Err()`. A `retryDelay` of 0 uses a 1-second default.
+
+#### Notes
+
+- Alan locks have no TTL / session; once held, the holder keeps the lock
+  until it calls `Unlock`, exits gracefully (LEAVE), or stops heartbeating
+  (detected via `HeartbeatTimeout`). There is no mid-run "lock lost"
+  notification — these helpers assume holding the lock == being the leader.
+- The helpers do not pass a separate "leader context" to `fn`. If you need
+  a context scoped strictly to the leadership window (e.g. to cancel
+  dependent workers when leadership ends), derive one inside `fn`.
 
 ## Quorum
 
@@ -373,11 +510,20 @@ When encryption is enabled:
 
 ## API Reference
 
+### Package-level
+
+| Function | Description |
+|----------|-------------|
+| `New(Config)` | Create new Alan instance |
+| `SetDefault(*Alan)` | Register process-wide default instance |
+| `Default() (*Alan, error)` | Get the default instance |
+| `MustDefault() *Alan` | Get the default instance or panic |
+| `HasDefault() bool` | Report whether a default has been set |
+
 ### Alan
 
 | Method | Description |
 |--------|-------------|
-| `New(Config)` | Create new Alan instance |
 | `OnPeerJoin(handler)` | Set callback for peer join events |
 | `OnPeerLeave(handler)` | Set callback for peer leave events |
 | `Start(ctx, handler)` | Start the peer discovery system (blocking) |
@@ -390,6 +536,8 @@ When encryption is enabled:
 | `Lock(ctx, key)` | Acquire a distributed lock (blocking) |
 | `TryLock(key)` | Try to acquire a lock (non-blocking) |
 | `Unlock(key)` | Release a distributed lock |
+| `RunAsLeader(ctx, key, fn)` | Acquire lock, run fn while holding it, release on return |
+| `LeaderLoop(ctx, key, retry, fn)` | Continuously re-acquire and run fn until ctx cancelled |
 | `HasQuorum()` | Check if quorum is currently met |
 | `WaitForQuorum(ctx)` | Block until quorum is reached |
 | `QuorumSize()` | Get required peer count for quorum |
@@ -434,6 +582,7 @@ type MessageHandler func(ctx context.Context, msg Message)
 var ErrPeerDisconnected = errors.New("peer disconnected before responding")
 var ErrNoQuorum = errors.New("quorum not reached")
 var ErrLockNotHeld = errors.New("lock not held by this instance")
+var ErrNoDefault = errors.New("alan: no default instance set")
 ```
 
 ## License
