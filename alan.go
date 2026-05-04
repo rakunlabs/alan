@@ -784,11 +784,25 @@ func (a *Alan) acceptLoop() error {
 			continue
 		}
 
-		// Determine peer address
+		// Determine peer address — normalize to the configured port
+		// since conn.RemoteAddr() returns the ephemeral source port,
+		// not the peer's listening port. All peers use the same port.
 		remoteAddr := conn.RemoteAddr()
-		udpAddr, ok := remoteAddr.(*net.UDPAddr)
+		rawAddr, ok := remoteAddr.(*net.UDPAddr)
 		if !ok {
 			conn.CloseWithError(1, "unsupported address type")
+			continue
+		}
+		udpAddr := &net.UDPAddr{IP: rawAddr.IP, Port: a.config.Port, Zone: rawAddr.Zone}
+
+		// Skip self
+		localAddr := a.listener.Addr().(*net.UDPAddr)
+		if udpAddr.IP.Equal(localAddr.IP) && udpAddr.Port == localAddr.Port {
+			conn.CloseWithError(0, "self-connection")
+			continue
+		}
+		if isOwnIP(udpAddr.IP) && udpAddr.Port == localAddr.Port {
+			conn.CloseWithError(0, "self-connection")
 			continue
 		}
 
@@ -1010,6 +1024,10 @@ func (a *Alan) Refresh() error {
 	for _, ip := range ips {
 		peerAddr := &net.UDPAddr{IP: ip, Port: a.config.Port}
 
+		// Skip self
+		if peerAddr.IP.Equal(localAddr.IP) && peerAddr.Port == localAddr.Port {
+			continue
+		}
 		if isOwnIP(ip) && peerAddr.Port == localAddr.Port {
 			continue
 		}
