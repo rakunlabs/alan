@@ -585,6 +585,25 @@ var ErrLockNotHeld = errors.New("lock not held by this instance")
 var ErrNoDefault = errors.New("alan: no default instance set")
 ```
 
+## UDP Buffer Size (Linux)
+
+QUIC performs best with larger UDP buffers. If you see a warning about receive buffer size, increase the OS limits:
+
+```bash
+sudo sysctl -w net.core.rmem_max=7500000
+sudo sysctl -w net.core.wmem_max=7500000
+```
+
+To persist across reboots, add to `/etc/sysctl.conf`:
+
+```
+net.core.rmem_max=7500000
+net.core.wmem_max=7500000
+```
+
+This is optional — the application works without it, but may drop packets under heavy load.
+
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.

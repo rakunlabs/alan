@@ -643,10 +643,10 @@ func TestQuorumHelpers(t *testing.T) {
 		t.Error("expected HasQuorum()=true when Replicas=0")
 	}
 
-	// With replicas
+	// With replicas (3-node cluster: quorum = 3/2 = 1 peer needed)
 	a, _ = New(Config{Port: 5000, Replicas: 3})
-	if a.QuorumSize() != 2 {
-		t.Errorf("expected quorum size 2, got %d", a.QuorumSize())
+	if a.QuorumSize() != 1 {
+		t.Errorf("expected quorum size 1, got %d", a.QuorumSize())
 	}
 	if a.HasQuorum() {
 		t.Error("expected HasQuorum()=false with 0 peers and Replicas=3")

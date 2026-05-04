@@ -695,12 +695,15 @@ func (a *Alan) Ready() <-chan struct{} {
 	return a.readyChan
 }
 
-// QuorumSize returns the number of peers required for quorum.
+// QuorumSize returns the number of peers (excluding self) required for quorum.
+// Replicas represents the total cluster size including self.
+// Quorum = majority of cluster = (Replicas/2)+1, but since PeerCount excludes
+// self, we subtract 1: need (Replicas/2+1)-1 = Replicas/2 peers.
 func (a *Alan) QuorumSize() int {
 	if a.config.Replicas == 0 {
 		return 0
 	}
-	return (a.config.Replicas / 2) + 1
+	return a.config.Replicas / 2
 }
 
 // HasQuorum returns true if the current number of peers meets the quorum requirement.
