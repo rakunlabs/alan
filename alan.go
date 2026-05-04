@@ -787,24 +787,21 @@ func (a *Alan) acceptLoop() error {
 			continue
 		}
 
-		// Determine peer address — normalize to the configured port
-		// since conn.RemoteAddr() returns the ephemeral source port,
-		// not the peer's listening port. All peers use the same port.
+		// Determine peer address from the connection's remote address.
+		// Since QUIC transport reuses the listener's UDP socket for outgoing
+		// dials, the remote address port IS the peer's listening port.
 		remoteAddr := conn.RemoteAddr()
 		rawAddr, ok := remoteAddr.(*net.UDPAddr)
 		if !ok {
 			conn.CloseWithError(1, "unsupported address type")
 			continue
 		}
-		udpAddr := &net.UDPAddr{IP: rawAddr.IP, Port: a.config.Port, Zone: rawAddr.Zone}
+		udpAddr := &net.UDPAddr{IP: rawAddr.IP, Port: rawAddr.Port, Zone: rawAddr.Zone}
 
-		// Skip self
+		// Skip self — a self-connection occurs when our own transport
+		// dials our own listener (same IP and same port).
 		localAddr := a.listener.Addr().(*net.UDPAddr)
-		if udpAddr.IP.Equal(localAddr.IP) && udpAddr.Port == localAddr.Port {
-			conn.CloseWithError(0, "self-connection")
-			continue
-		}
-		if isOwnIP(udpAddr.IP) && udpAddr.Port == localAddr.Port {
+		if udpAddr.Port == localAddr.Port && (udpAddr.IP.Equal(localAddr.IP) || isOwnIP(udpAddr.IP)) {
 			conn.CloseWithError(0, "self-connection")
 			continue
 		}
