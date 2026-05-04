@@ -59,18 +59,21 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
+    // Register message handler
+    a.Handle("", func(ctx context.Context, msg alan.Message) {
+        fmt.Printf("Received from %s: %s\n", msg.Addr, msg.Data)
+    })
+
     // Start in background
     go func() {
-        a.Start(ctx, func(ctx context.Context, msg alan.Message) {
-            fmt.Printf("Received from %s: %s\n", msg.Addr, msg.Data)
-        })
+        a.Start(ctx)
     }()
 
-    // Send to all peers (waits for quorum if configured)
-    a.Send(ctx, []byte("Hello everyone!"))
+    // Send to all peers
+    a.Send("", []byte("Hello everyone!"))
 
-    // Send to specific peer (direct send, no quorum check)
-    a.SendTo(specificAddr, []byte("Hello you!"))
+    // Send to specific peer
+    a.SendTo(specificAddr, "", []byte("Hello you!"))
 
     // Graceful shutdown
     a.Stop()
@@ -95,7 +98,8 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    go a.Start(ctx, handleMessage)
+    a.Handle("", handleMessage)
+    go a.Start(ctx)
 
     // Register as the process-wide default
     alan.SetDefault(a)
@@ -116,7 +120,7 @@ func Notify(data []byte) error {
     if err != nil {
         return err // no default registered yet
     }
-    a.Send(data)
+    a.Send("", data)
     return nil
 }
 ```
@@ -163,7 +167,7 @@ Alan supports a request-reply pattern for scenarios where you need responses fro
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 defer cancel()
 
-replies, err := a.SendAndWaitReply(ctx, []byte("status-request"))
+replies, err := a.SendAndWaitReply(ctx, "", []byte("status-request"))
 if err != nil && !errors.Is(err, context.DeadlineExceeded) {
     log.Fatal(err)
 }
@@ -179,7 +183,7 @@ for _, reply := range replies {
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 defer cancel()
 
-reply, err := a.SendToAndWaitReply(ctx, peerAddr, []byte("ping"))
+reply, err := a.SendToAndWaitReply(ctx, peerAddr, "", []byte("ping"))
 if err != nil {
     log.Fatal(err)
 }
@@ -189,7 +193,7 @@ fmt.Printf("Got response: %s\n", reply.Data)
 ### Handling Requests (Responder Side)
 
 ```go
-a.Start(ctx, func(ctx context.Context, msg alan.Message) {
+a.Handle("", func(ctx context.Context, msg alan.Message) {
     if msg.IsRequest() {
         // This is a request expecting a reply
         response := processRequest(msg.Data)
@@ -199,6 +203,7 @@ a.Start(ctx, func(ctx context.Context, msg alan.Message) {
         handleMessage(msg.Data)
     }
 })
+go a.Start(ctx)
 ```
 
 ### Notes on Request-Reply

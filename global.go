@@ -19,7 +19,8 @@ var defaultInstance atomic.Pointer[Alan]
 // then access the instance from any package via Default() / MustDefault().
 //
 //	a, _ := alan.New(cfg)
-//	_ = a.Start(ctx, handler)
+//	a.Handle("myapp", handler)
+//	_ = a.Start(ctx)
 //	alan.SetDefault(a)
 //
 // Passing nil clears the default.

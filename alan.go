@@ -74,7 +74,10 @@ type MessageHandler func(ctx context.Context, msg Message)
 
 // Message represents an incoming data message from a peer
 type Message struct {
-	// Data contains the message payload
+	// Type is the matched handler prefix (set by the internal mux).
+	// Empty if no prefix matched or if a catch-all handler processed it.
+	Type string
+	// Data contains the message payload (with the Type prefix stripped)
 	Data []byte
 	// Addr is the sender's address
 	Addr *net.UDPAddr
@@ -193,7 +196,10 @@ type Alan struct {
 	// Callbacks
 	onPeerJoin  PeerHandler
 	onPeerLeave PeerHandler
-	onMessage   MessageHandler
+
+	// Message routing: prefix -> handler
+	handlers   map[string]MessageHandler
+	handlersMu sync.RWMutex
 }
 
 // New creates a new Alan instance with the given configuration.
@@ -231,6 +237,7 @@ func New(config Config) (*Alan, error) {
 		peerEventCh:     make(chan peerEvent, config.MessageQueueSize),
 		locks:           make(map[string]*lockState),
 		pendingLocks:    make(map[string]*pendingLock),
+		handlers:        make(map[string]MessageHandler),
 	}
 
 	return a, nil
@@ -250,16 +257,49 @@ func (a *Alan) OnPeerLeave(handler PeerHandler) {
 	a.onPeerLeave = handler
 }
 
+// MaxTypeLen is the maximum length of a message type string (limited by uint16 wire encoding).
+const MaxTypeLen = 65535
+
+// ErrTypeTooLong is returned when a message type exceeds [MaxTypeLen] bytes.
+var ErrTypeTooLong = errors.New("alan: message type exceeds maximum length (65535 bytes)")
+
+// Handle registers a message handler for the given message type. When a message
+// arrives with a matching type, the handler is called with Type set and the
+// type already stripped from Data.
+//
+// Use an empty string "" to register a catch-all handler for messages that
+// don't match any registered type.
+//
+// This is safe to call before or after Start, and concurrently from multiple
+// goroutines.
+func (a *Alan) Handle(msgType string, handler MessageHandler) error {
+	if len(msgType) > MaxTypeLen {
+		return ErrTypeTooLong
+	}
+	a.handlersMu.Lock()
+	a.handlers[msgType] = handler
+	a.handlersMu.Unlock()
+	return nil
+}
+
+// Remove unregisters the handler for the given type prefix.
+func (a *Alan) Remove(msgType string) {
+	a.handlersMu.Lock()
+	delete(a.handlers, msgType)
+	a.handlersMu.Unlock()
+}
+
 // Start initializes the QUIC-based peer discovery system.
 // This method blocks until the context is cancelled or Stop() is called.
-func (a *Alan) Start(ctx context.Context, handler MessageHandler) error {
+//
+// Register message handlers with [Handle] before or after calling Start.
+func (a *Alan) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.running {
 		a.mu.Unlock()
 		return ErrAlreadyStarted
 	}
 	a.running = true
-	a.onMessage = handler
 	a.stopChan = make(chan struct{})
 	a.ctx, a.cancel = context.WithCancel(ctx)
 	a.mu.Unlock()
@@ -406,8 +446,9 @@ func (a *Alan) sendOnStream(conn *quic.Conn, msgType byte, payload []byte) error
 	return nil
 }
 
-// Send broadcasts data to all peers.
-func (a *Alan) Send(data []byte) []SendResult {
+// Send broadcasts data to all peers under the given message type.
+// The msgType is used for routing on the receiver via [Handle].
+func (a *Alan) Send(msgType string, data []byte) []SendResult {
 	a.mu.RLock()
 	if !a.running {
 		a.mu.RUnlock()
@@ -415,6 +456,7 @@ func (a *Alan) Send(data []byte) []SendResult {
 	}
 	a.mu.RUnlock()
 
+	payload := encodeTypedPayload(msgType, data)
 	peerConns := a.peers.connAddrs()
 	results := make([]SendResult, len(peerConns))
 
@@ -423,7 +465,7 @@ func (a *Alan) Send(data []byte) []SendResult {
 		wg.Add(1)
 		go func(idx int, addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			err := a.sendOnStream(conn, MsgTypeData, data)
+			err := a.sendOnStream(conn, MsgTypeData, payload)
 			sent := 0
 			if err == nil {
 				sent = len(data)
@@ -436,8 +478,8 @@ func (a *Alan) Send(data []byte) []SendResult {
 	return results
 }
 
-// SendTo sends data to a specific peer.
-func (a *Alan) SendTo(addr *net.UDPAddr, data []byte) (int, error) {
+// SendTo sends data to a specific peer under the given message type.
+func (a *Alan) SendTo(addr *net.UDPAddr, msgType string, data []byte) (int, error) {
 	a.mu.RLock()
 	if !a.running {
 		a.mu.RUnlock()
@@ -450,14 +492,16 @@ func (a *Alan) SendTo(addr *net.UDPAddr, data []byte) (int, error) {
 		return 0, ErrNoPeerConnection
 	}
 
-	if err := a.sendOnStream(conn, MsgTypeData, data); err != nil {
+	payload := encodeTypedPayload(msgType, data)
+	if err := a.sendOnStream(conn, MsgTypeData, payload); err != nil {
 		return 0, err
 	}
 	return len(data), nil
 }
 
 // SendAndWaitReply broadcasts a request to all peers and waits for their responses.
-func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, error) {
+// The msgType is used for routing on the receiver via [Handle].
+func (a *Alan) SendAndWaitReply(ctx context.Context, msgType string, data []byte) ([]Reply, error) {
 	a.mu.RLock()
 	if !a.running {
 		a.mu.RUnlock()
@@ -502,9 +546,10 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 	// Send request to all peers via bidirectional streams.
 	// Each stream carries: REQUEST with requestID, then we read RESPONSE back.
 	// The response is routed through pending.responseChan.
-	payload := make([]byte, RequestIDSize+len(data))
+	typedData := encodeTypedPayload(msgType, data)
+	payload := make([]byte, RequestIDSize+len(typedData))
 	copy(payload[:RequestIDSize], requestID)
-	copy(payload[RequestIDSize:], data)
+	copy(payload[RequestIDSize:], typedData)
 
 	var wg sync.WaitGroup
 	for _, pc := range peerConns {
@@ -551,7 +596,8 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 }
 
 // SendToAndWaitReply sends a request to a specific peer and waits for its response.
-func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data []byte) (*Reply, error) {
+// The msgType is used for routing on the receiver via [Handle].
+func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, msgType string, data []byte) (*Reply, error) {
 	a.mu.RLock()
 	if !a.running {
 		a.mu.RUnlock()
@@ -592,9 +638,10 @@ func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data [
 	}()
 
 	// Send request
-	payload := make([]byte, RequestIDSize+len(data))
+	typedData := encodeTypedPayload(msgType, data)
+	payload := make([]byte, RequestIDSize+len(typedData))
 	copy(payload[:RequestIDSize], requestID)
-	copy(payload[RequestIDSize:], data)
+	copy(payload[RequestIDSize:], typedData)
 
 	if err := a.sendOnStream(conn, MsgTypeRequest, payload); err != nil {
 		return nil, err
@@ -854,8 +901,10 @@ func (a *Alan) handleStream(stream *quic.Stream, addr *net.UDPAddr) {
 func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAddr) {
 	switch msgType {
 	case MsgTypeData:
+		typeName, data := decodeTypedPayload(payload)
 		msg := Message{
-			Data: payload,
+			Type: typeName,
+			Data: data,
 			Addr: sourceAddr,
 		}
 		a.enqueueMessage(sourceAddr, msg)
@@ -865,9 +914,10 @@ func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAd
 			return
 		}
 		requestID := payload[:RequestIDSize]
-		data := payload[RequestIDSize:]
+		typeName, data := decodeTypedPayload(payload[RequestIDSize:])
 
 		msg := Message{
+			Type:      typeName,
 			Data:      data,
 			Addr:      sourceAddr,
 			requestID: requestID,
@@ -1120,15 +1170,23 @@ func (a *Alan) peerWorker(ctx context.Context, pq *peerQueue) {
 			if !ok {
 				return
 			}
-
-			a.mu.RLock()
-			handler := a.onMessage
-			a.mu.RUnlock()
-
-			if handler != nil {
-				handler(ctx, msg)
-			}
+			a.dispatch(ctx, msg)
 		}
+	}
+}
+
+// dispatch routes a message to the matching handler by msg.Type.
+func (a *Alan) dispatch(ctx context.Context, msg Message) {
+	a.handlersMu.RLock()
+	handler, ok := a.handlers[msg.Type]
+	if !ok {
+		// Try catch-all handler.
+		handler, ok = a.handlers[""]
+	}
+	a.handlersMu.RUnlock()
+
+	if ok && handler != nil {
+		handler(ctx, msg)
 	}
 }
 

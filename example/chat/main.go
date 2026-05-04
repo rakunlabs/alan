@@ -269,7 +269,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Send message to all peers
 				chatMsg := ChatMessage{Name: m.myName, Text: text}
 				data, _ := json.Marshal(chatMsg)
-				m.alan.Send(data)
+				m.alan.Send("", data)
 
 				// Add to local display
 				m.messages = append(m.messages, displayMessage{
@@ -608,19 +608,20 @@ func run(ctx context.Context) error {
 
 	// Start Alan in background
 	var errAlan error
-	go func() {
-		errAlan = a.Start(ctx, func(ctx context.Context, msg alan.Message) {
-			var chatMsg ChatMessage
-			if err := json.Unmarshal(msg.Data, &chatMsg); err != nil {
-				return // Ignore malformed messages
-			}
+	a.Handle("", func(ctx context.Context, msg alan.Message) {
+		var chatMsg ChatMessage
+		if err := json.Unmarshal(msg.Data, &chatMsg); err != nil {
+			return // Ignore malformed messages
+		}
 
-			p.Send(msgReceived{
-				chatMsg: chatMsg,
-				from:    msg.Addr,
-				time:    time.Now(),
-			})
+		p.Send(msgReceived{
+			chatMsg: chatMsg,
+			from:    msg.Addr,
+			time:    time.Now(),
 		})
+	})
+	go func() {
+		errAlan = a.Start(ctx)
 		if errAlan != nil && ctx.Err() == nil {
 			p.Send(msgError{err: errAlan})
 		}

@@ -24,38 +24,6 @@ const (
 	pskPrefix = "github.com/rakunlabs/alan/psk"
 )
 
-// generateSelfSignedCert creates an ephemeral self-signed ECDSA certificate for QUIC TLS.
-func generateSelfSignedCert() (tls.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate key: %w", err)
-	}
-
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate serial: %w", err)
-	}
-
-	tmpl := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "alan-peer"},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create cert: %w", err)
-	}
-
-	return tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  key,
-	}, nil
-}
-
 // derivePSKHash derives a 32-byte hash from the shared key for PSK verification via ALPN trick.
 func derivePSKHash(sharedKey []byte) [32]byte {
 	return sha256.Sum256(append([]byte(pskPrefix), sharedKey...))

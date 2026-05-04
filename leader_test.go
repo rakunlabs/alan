@@ -17,7 +17,7 @@ func TestRunAsLeader_HappyPath(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -52,7 +52,7 @@ func TestRunAsLeader_FnError(t *testing.T) {
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 0})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -80,7 +80,7 @@ func TestRunAsLeader_CtxCancelBeforeAcquire(t *testing.T) {
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 3})
 	startCtx, startCancel := context.WithCancel(context.Background())
 	defer startCancel()
-	go a.Start(startCtx, func(ctx context.Context, msg Message) {})
+	go a.Start(startCtx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -107,7 +107,7 @@ func TestRunAsLeader_CtxCancelDuringFn(t *testing.T) {
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 0})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -149,7 +149,7 @@ func TestLeaderLoop_RestartsFn(t *testing.T) {
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 0})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -189,7 +189,7 @@ func TestLeaderLoop_ExitsOnCtxCancelDuringFn(t *testing.T) {
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 0})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -230,7 +230,7 @@ func TestLeaderLoop_ExitsOnCtxCancelDuringBackoff(t *testing.T) {
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 0})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -274,7 +274,7 @@ func TestLeaderLoop_DefaultRetryDelay(t *testing.T) {
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 0})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 

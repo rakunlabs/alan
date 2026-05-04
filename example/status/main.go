@@ -65,8 +65,9 @@ func run(ctx context.Context) error {
 		slog.Info("peer left", "addr", addr.String())
 	})
 
+	al.Handle("", AlanHandler)
 	g.Go(func() error {
-		return al.Start(ctx, AlanHandler)
+		return al.Start(ctx)
 	})
 
 	// ///////////////////////////////////////////
@@ -88,7 +89,7 @@ func run(ctx context.Context) error {
 
 func HttpHandler(a *ada.Context) error {
 	// Send request to all peers with our request ID
-	replies, err := al.SendAndWaitReply(a.Request.Context(), []byte("REQ-ID"))
+	replies, err := al.SendAndWaitReply(a.Request.Context(), "", []byte("REQ-ID"))
 	if err != nil {
 		return err
 	}

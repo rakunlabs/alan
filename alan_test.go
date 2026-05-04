@@ -239,7 +239,7 @@ func TestStartStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 
 	// Verify it's running
@@ -272,12 +272,13 @@ func TestSendTo(t *testing.T) {
 	var msgWg sync.WaitGroup
 	msgWg.Add(1)
 
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {
+	a1.Handle("", func(ctx context.Context, msg Message) {
 		received = msg.Data
 		msgWg.Done()
 	})
+	go a1.Start(ctx)
 
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -287,7 +288,7 @@ func TestSendTo(t *testing.T) {
 
 	// SendTo specific address
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
-	_, err := a2.SendTo(targetAddr, []byte("Direct message"))
+	_, err := a2.SendTo(targetAddr, "", []byte("Direct message"))
 	if err != nil {
 		t.Fatalf("SendTo failed: %v", err)
 	}
@@ -313,12 +314,13 @@ func TestSend(t *testing.T) {
 	var msgWg sync.WaitGroup
 	msgWg.Add(1)
 
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {
+	a1.Handle("", func(ctx context.Context, msg Message) {
 		received = msg.Data
 		msgWg.Done()
 	})
+	go a1.Start(ctx)
 
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -327,7 +329,7 @@ func TestSend(t *testing.T) {
 	connectPeers(t, a1, a2)
 
 	// Broadcast (only a1 is peer)
-	results := a2.Send([]byte("Broadcast message"))
+	results := a2.Send("", []byte("Broadcast message"))
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -353,13 +355,14 @@ func TestSendToAndWaitReply(t *testing.T) {
 	defer cancel()
 
 	// a1 echoes requests with a prefix
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {
+	a1.Handle("", func(ctx context.Context, msg Message) {
 		if msg.IsRequest() {
 			a1.Reply(msg, append([]byte("reply:"), msg.Data...))
 		}
 	})
+	go a1.Start(ctx)
 
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -383,7 +386,7 @@ func TestSendToAndWaitReply(t *testing.T) {
 	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer reqCancel()
 
-	reply, err := a2.SendToAndWaitReply(reqCtx, targetAddr, []byte("hello"))
+	reply, err := a2.SendToAndWaitReply(reqCtx, targetAddr, "", []byte("hello"))
 	if err != nil {
 		t.Fatalf("SendToAndWaitReply failed: %v", err)
 	}
@@ -404,13 +407,14 @@ func TestSendAndWaitReply(t *testing.T) {
 	defer cancel()
 
 	// a1 echoes requests
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {
+	a1.Handle("", func(ctx context.Context, msg Message) {
 		if msg.IsRequest() {
 			a1.Reply(msg, append([]byte("echo:"), msg.Data...))
 		}
 	})
+	go a1.Start(ctx)
 
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -431,7 +435,7 @@ func TestSendAndWaitReply(t *testing.T) {
 	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer reqCancel()
 
-	replies, err := a2.SendAndWaitReply(reqCtx, []byte("world"))
+	replies, err := a2.SendAndWaitReply(reqCtx, "", []byte("world"))
 	if err != nil {
 		t.Fatalf("SendAndWaitReply failed: %v", err)
 	}
@@ -476,7 +480,7 @@ func TestPeerJoinLeaveCallbacks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a1.Start(ctx)
 	<-a1.Ready()
 
 	// Create a2 and connect to a1
@@ -487,7 +491,7 @@ func TestPeerJoinLeaveCallbacks(t *testing.T) {
 		HeartbeatTimeout:  5 * time.Second,
 	})
 
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a2.Start(ctx)
 	<-a2.Ready()
 
 	connectPeers(t, a1, a2)
@@ -533,11 +537,12 @@ func TestSecurityPSK(t *testing.T) {
 	var msgWg sync.WaitGroup
 	msgWg.Add(1)
 
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {
+	a1.Handle("", func(ctx context.Context, msg Message) {
 		received = msg.Data
 		msgWg.Done()
 	})
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a1.Start(ctx)
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -545,7 +550,7 @@ func TestSecurityPSK(t *testing.T) {
 	connectPeers(t, a1, a2)
 
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
-	_, err := a2.SendTo(targetAddr, []byte("secure msg"))
+	_, err := a2.SendTo(targetAddr, "", []byte("secure msg"))
 	if err != nil {
 		t.Fatalf("SendTo failed: %v", err)
 	}
@@ -577,8 +582,8 @@ func TestSecurityPSK_Mismatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {})
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a1.Start(ctx)
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -605,7 +610,7 @@ func TestLockUnlock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -657,14 +662,14 @@ func TestSendNotStarted(t *testing.T) {
 	a, _ := New(Config{Port: 5000})
 
 	// Send before Start should return nil
-	results := a.Send([]byte("test"))
+	results := a.Send("", []byte("test"))
 	if results != nil {
 		t.Error("expected nil results before start")
 	}
 
 	// SendTo before Start should return error
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5000}
-	_, err := a.SendTo(addr, []byte("test"))
+	_, err := a.SendTo(addr, "", []byte("test"))
 	if !errors.Is(err, ErrNotStarted) {
 		t.Errorf("expected ErrNotStarted, got %v", err)
 	}
@@ -690,12 +695,13 @@ func TestLargeData(t *testing.T) {
 	var msgWg sync.WaitGroup
 	msgWg.Add(1)
 
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {
+	a1.Handle("", func(ctx context.Context, msg Message) {
 		received = msg.Data
 		msgWg.Done()
 	})
+	go a1.Start(ctx)
 
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -703,7 +709,7 @@ func TestLargeData(t *testing.T) {
 	connectPeers(t, a1, a2)
 
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
-	_, err := a2.SendTo(targetAddr, largeData)
+	_, err := a2.SendTo(targetAddr, "", largeData)
 	if err != nil {
 		t.Fatalf("SendTo failed: %v", err)
 	}
@@ -723,7 +729,7 @@ func TestWaitForQuorum(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go a.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a.Start(ctx)
 	<-a.Ready()
 	defer a.Stop()
 
@@ -753,14 +759,15 @@ func TestMultipleSends(t *testing.T) {
 	var msgWg sync.WaitGroup
 	msgWg.Add(numMessages)
 
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {
+	a1.Handle("", func(ctx context.Context, msg Message) {
 		mu.Lock()
 		received = append(received, msg.Data)
 		mu.Unlock()
 		msgWg.Done()
 	})
+	go a1.Start(ctx)
 
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
+	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
@@ -769,7 +776,7 @@ func TestMultipleSends(t *testing.T) {
 
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
 	for i := 0; i < numMessages; i++ {
-		_, err := a2.SendTo(targetAddr, []byte("msg"))
+		_, err := a2.SendTo(targetAddr, "", []byte("msg"))
 		if err != nil {
 			t.Fatalf("SendTo %d failed: %v", i, err)
 		}

@@ -50,3 +50,28 @@ func decodeLockPayload(payload []byte) (requestID []byte, key string, err error)
 	key = string(payload[RequestIDSize+2 : RequestIDSize+2+int(keyLen)])
 	return requestID, key, nil
 }
+
+// encodeTypedPayload prepends a length-prefixed type string to user data.
+// Wire format: [TypeLen:2][Type:T][Data:N]
+func encodeTypedPayload(msgType string, data []byte) []byte {
+	typeBytes := []byte(msgType)
+	out := make([]byte, 2+len(typeBytes)+len(data))
+	binary.BigEndian.PutUint16(out, uint16(len(typeBytes)))
+	copy(out[2:], typeBytes)
+	copy(out[2+len(typeBytes):], data)
+	return out
+}
+
+// decodeTypedPayload extracts the type string and user data from a typed payload.
+func decodeTypedPayload(payload []byte) (msgType string, data []byte) {
+	if len(payload) < 2 {
+		return "", payload
+	}
+	typeLen := binary.BigEndian.Uint16(payload[:2])
+	if len(payload) < 2+int(typeLen) {
+		return "", payload
+	}
+	msgType = string(payload[2 : 2+typeLen])
+	data = payload[2+typeLen:]
+	return msgType, data
+}
