@@ -554,7 +554,7 @@ func run(ctx context.Context) error {
 		Config: alan.Config{
 			DNSAddr: "alan-chat.local",
 			Port:    5000,
-			Security: &alan.SecurityConfig{
+			Security: alan.SecurityConfig{
 				Key:     []byte("alan-chat-default-key"),
 				Enabled: true,
 			},

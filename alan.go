@@ -2,8 +2,8 @@ package alan
 
 import (
 	"context"
-	"crypto/cipher"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -11,19 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/chacha20poly1305"
+	"github.com/quic-go/quic-go"
 )
 
 var (
 	// ErrEmptyKey is returned when the security key is empty
 	ErrEmptyKey = errors.New("security key must not be empty")
-	// ErrSecurityNotEnabled is returned when trying to use encryption without enabling it
-	ErrSecurityNotEnabled = errors.New("security is not enabled")
-	// ErrMessageTooShort is returned when encrypted message is shorter than nonce size
-	ErrMessageTooShort = errors.New("encrypted message too short")
-	// ErrDecryptionFailed is returned when message authentication fails
-	ErrDecryptionFailed = errors.New("decryption failed: message authentication failed")
 
 	// ErrAlreadyStarted is returned when Start is called on an already running instance
 	ErrAlreadyStarted = errors.New("alan is already started")
@@ -35,13 +28,13 @@ var (
 	ErrNoQuorum = errors.New("quorum not reached")
 	// ErrLockNotHeld is returned when trying to unlock a lock not held by this instance
 	ErrLockNotHeld = errors.New("lock not held by this instance")
+	// ErrNoPeerConnection is returned when no QUIC connection exists for a peer
+	ErrNoPeerConnection = errors.New("no QUIC connection to peer")
 )
 
 // Config holds all configuration for Alan
 type Config struct {
 	// DNSAddr is the DNS name to resolve for discovering peers (optional).
-	// If empty or DNS resolution fails, the library will still start and
-	// can discover peers through incoming messages or later DNS resolution.
 	DNSAddr string `cfg:"dns_addr" json:"dns_addr"`
 	// BindAddr is the local address to bind to (default: "0.0.0.0" for all interfaces)
 	BindAddr string `cfg:"bind_addr" json:"bind_addr"`
@@ -50,33 +43,26 @@ type Config struct {
 	Port int `cfg:"port" json:"port"`
 	// Timeout is the read/write timeout duration (default: 5s)
 	Timeout time.Duration `cfg:"timeout" json:"timeout"`
-	// BufferSize is the buffer size for receiving messages (default: 4096)
-	BufferSize int `cfg:"buffer_size" json:"buffer_size"`
 	// Security holds optional encryption configuration
 	Security SecurityConfig `cfg:"security" json:"security"`
-	// HeartbeatInterval is how often to send heartbeats (default: 5s)
+	// HeartbeatInterval controls QUIC KeepAlivePeriod (default: 5s)
 	HeartbeatInterval time.Duration `cfg:"heartbeat_interval" json:"heartbeat_interval"`
-	// HeartbeatTimeout is when a peer is considered dead (default: 15s)
+	// HeartbeatTimeout controls QUIC MaxIdleTimeout (default: 15s)
 	HeartbeatTimeout time.Duration `cfg:"heartbeat_timeout" json:"heartbeat_timeout"`
 	// RefreshInterval is how often to re-resolve DNS (default: 30s, set to -1 to disable)
 	RefreshInterval time.Duration `cfg:"refresh_interval" json:"refresh_interval"`
 	// MessageQueueSize is the per-peer message buffer size (default: 256)
-	// Messages from the same peer are processed in order.
-	// When the queue is full, the listener blocks until space is available.
 	MessageQueueSize int `cfg:"message_queue_size" json:"message_queue_size"`
 	// Replicas is the expected cluster size for distributed operations.
-	// When set, operations like Lock() will wait until
-	// (Replicas/2)+1 peers are present before proceeding.
-	// Set to 0 to disable quorum checks (default).
 	Replicas int `cfg:"replicas" json:"replicas"`
 }
 
 // SecurityConfig holds encryption settings
 type SecurityConfig struct {
-	// Key is the pre-shared key for encryption.
-	// Can be any length; it is derived into a 32-byte key using Argon2id.
+	// Key is the pre-shared key for cluster membership.
+	// Only peers with the same key can connect.
 	Key []byte `cfg:"key" json:"key" log:"-"`
-	// Enabled determines whether encryption is active
+	// Enabled determines whether PSK verification is active
 	Enabled bool `cfg:"enabled" json:"enabled"`
 }
 
@@ -88,12 +74,14 @@ type MessageHandler func(ctx context.Context, msg Message)
 
 // Message represents an incoming data message from a peer
 type Message struct {
-	// Data contains the decrypted message payload
+	// Data contains the message payload
 	Data []byte
 	// Addr is the sender's address
 	Addr *net.UDPAddr
 	// requestID is set for request messages (internal use)
 	requestID []byte
+	// replyStream is the QUIC stream to reply on (for request/reply pattern)
+	replyStream *quic.Stream
 }
 
 // IsRequest returns true if this message is a request expecting a reply
@@ -141,17 +129,14 @@ type peerEvent struct {
 
 // lockState tracks the state of a distributed lock
 type lockState struct {
-	// holder is the address of the peer holding the lock.
-	// nil means this instance holds the lock locally.
-	holder *net.UDPAddr
-	// waiters are channels waiting to be notified when the lock is released
+	holder  *net.UDPAddr
 	waiters []chan struct{}
 }
 
 // pendingLock tracks an in-flight lock request
 type pendingLock struct {
-	grantCh chan *net.UDPAddr // receives grant notifications
-	denyCh  chan *net.UDPAddr // receives deny notifications
+	grantCh chan *net.UDPAddr
+	denyCh  chan *net.UDPAddr
 }
 
 // SendResult contains the result of sending to a single peer
@@ -164,16 +149,20 @@ type SendResult struct {
 	Error error
 }
 
-// Alan is the main entry point for the UDP peer discovery library.
+// Alan is the main entry point for the QUIC peer discovery library.
 type Alan struct {
 	config Config
-	aead   cipher.AEAD
 
 	// Peer management
 	peers *peers
 
-	// Network
-	conn *net.UDPConn
+	// QUIC networking
+	transport  *quic.Transport
+	listener   *quic.Listener
+	serverTLS  *tls.Config
+	clientTLS  *tls.Config
+	quicConfig *quic.Config
+	udpConn    *net.UDPConn // underlying UDP conn for Transport
 
 	// State
 	running   bool
@@ -216,9 +205,6 @@ func New(config Config) (*Alan, error) {
 	if config.Timeout == 0 {
 		config.Timeout = 5 * time.Second
 	}
-	if config.BufferSize == 0 {
-		config.BufferSize = 4096
-	}
 	if config.HeartbeatInterval == 0 {
 		config.HeartbeatInterval = 5 * time.Second
 	}
@@ -232,6 +218,10 @@ func New(config Config) (*Alan, error) {
 		config.MessageQueueSize = 256
 	}
 
+	if config.Security.Enabled && len(config.Security.Key) == 0 {
+		return nil, ErrEmptyKey
+	}
+
 	a := &Alan{
 		config:          config,
 		peers:           newPeers(),
@@ -241,23 +231,6 @@ func New(config Config) (*Alan, error) {
 		peerEventCh:     make(chan peerEvent, config.MessageQueueSize),
 		locks:           make(map[string]*lockState),
 		pendingLocks:    make(map[string]*pendingLock),
-	}
-
-	// Initialize encryption if security is enabled
-	if config.Security.Enabled {
-		if len(config.Security.Key) == 0 {
-			return nil, ErrEmptyKey
-		}
-
-		// Derive a 32-byte key using Argon2id
-		salt := []byte("github.com/rakunlabs/alan")
-		derivedKey := argon2.IDKey(config.Security.Key, salt, 1, 64*1024, 4, chacha20poly1305.KeySize)
-
-		aead, err := chacha20poly1305.NewX(derivedKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create cipher: %w", err)
-		}
-		a.aead = aead
 	}
 
 	return a, nil
@@ -277,11 +250,7 @@ func (a *Alan) OnPeerLeave(handler PeerHandler) {
 	a.onPeerLeave = handler
 }
 
-// Start initializes the peer discovery system:
-// - Resolves DNSAddr to discover initial peers (if configured and resolvable)
-// - Starts UDP server
-// - Sends JOIN to all peers
-// - Starts heartbeat goroutine
+// Start initializes the QUIC-based peer discovery system.
 // This method blocks until the context is cancelled or Stop() is called.
 func (a *Alan) Start(ctx context.Context, handler MessageHandler) error {
 	a.mu.Lock()
@@ -295,6 +264,24 @@ func (a *Alan) Start(ctx context.Context, handler MessageHandler) error {
 	a.ctx, a.cancel = context.WithCancel(ctx)
 	a.mu.Unlock()
 
+	// Generate TLS certificates
+	var sharedKey []byte
+	if a.config.Security.Enabled {
+		sharedKey = a.config.Security.Key
+	}
+
+	cert, err := generatePSKCert(sharedKey)
+	if err != nil {
+		a.mu.Lock()
+		a.running = false
+		a.mu.Unlock()
+		return fmt.Errorf("failed to generate TLS cert: %w", err)
+	}
+
+	a.serverTLS = newServerTLSConfig(cert, sharedKey)
+	a.clientTLS = newClientTLSConfig(cert, sharedKey)
+	a.quicConfig = newQUICConfig(a.config.HeartbeatInterval, a.config.HeartbeatTimeout)
+
 	// Create UDP socket
 	bindIP := net.IPv4zero
 	if a.config.BindAddr != "" {
@@ -306,11 +293,8 @@ func (a *Alan) Start(ctx context.Context, handler MessageHandler) error {
 			return fmt.Errorf("invalid BindAddr: %s", a.config.BindAddr)
 		}
 	}
-	addr := &net.UDPAddr{
-		IP:   bindIP,
-		Port: a.config.Port,
-	}
-	conn, err := net.ListenUDP("udp", addr)
+	udpAddr := &net.UDPAddr{IP: bindIP, Port: a.config.Port}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		a.mu.Lock()
 		a.running = false
@@ -319,23 +303,34 @@ func (a *Alan) Start(ctx context.Context, handler MessageHandler) error {
 	}
 
 	a.mu.Lock()
-	a.conn = conn
+	a.udpConn = udpConn
 	a.mu.Unlock()
 
-	// Resolve DNS and discover initial peers
-	if err := a.discoverPeers(); err != nil {
-		a.conn.Close()
+	// Create QUIC transport
+	tr := &quic.Transport{Conn: udpConn}
+	ln, err := tr.Listen(a.serverTLS, a.quicConfig)
+	if err != nil {
+		udpConn.Close()
+		a.mu.Lock()
+		a.running = false
+		a.mu.Unlock()
+		return fmt.Errorf("failed to start QUIC listener: %w", err)
+	}
+
+	a.mu.Lock()
+	a.transport = tr
+	a.listener = ln
+	a.mu.Unlock()
+
+	// Resolve DNS and dial initial peers
+	if err := a.discoverAndDialPeers(); err != nil {
+		ln.Close()
+		tr.Close()
 		a.mu.Lock()
 		a.running = false
 		a.mu.Unlock()
 		return fmt.Errorf("failed to discover peers: %w", err)
 	}
-
-	// Send JOIN to all peers
-	a.broadcastControl(MsgTypeJoin)
-
-	// Start heartbeat goroutine
-	go a.heartbeatLoop()
 
 	// Start DNS refresh goroutine if configured
 	if a.config.RefreshInterval > 0 {
@@ -350,8 +345,8 @@ func (a *Alan) Start(ctx context.Context, handler MessageHandler) error {
 	// Signal that we're ready to send/receive
 	close(a.readyChan)
 
-	// Start listening for messages (blocking)
-	return a.listen()
+	// Accept incoming QUIC connections (blocking)
+	return a.acceptLoop()
 }
 
 // Stop gracefully stops the peer discovery system
@@ -364,8 +359,12 @@ func (a *Alan) Stop() error {
 	a.running = false
 	a.mu.Unlock()
 
-	// Send LEAVE to all peers
-	a.broadcastControl(MsgTypeLeave)
+	// Close all QUIC connections to peers (this signals LEAVE via connection close)
+	for _, ca := range a.peers.connAddrs() {
+		if ca.Conn != nil {
+			(*ca.Conn).CloseWithError(0, "shutdown")
+		}
+	}
 
 	// Close all peer message queues
 	a.closeAllPeerQueues()
@@ -381,10 +380,29 @@ func (a *Alan) Stop() error {
 	}
 	close(a.stopChan)
 
-	// Close connection
-	if a.conn != nil {
-		return a.conn.Close()
+	// Close QUIC listener and transport
+	if a.listener != nil {
+		a.listener.Close()
 	}
+	if a.transport != nil {
+		a.transport.Close()
+	}
+
+	return nil
+}
+
+// sendOnStream opens a stream, writes a framed message, and closes it.
+func (a *Alan) sendOnStream(conn *quic.Conn, msgType byte, payload []byte) error {
+	stream, err := (*conn).OpenStreamSync(a.ctx)
+	if err != nil {
+		return fmt.Errorf("open stream: %w", err)
+	}
+	defer stream.Close()
+
+	if err := writeStreamMessage(stream, msgType, payload); err != nil {
+		return fmt.Errorf("write stream: %w", err)
+	}
+
 	return nil
 }
 
@@ -395,39 +413,23 @@ func (a *Alan) Send(data []byte) []SendResult {
 		a.mu.RUnlock()
 		return nil
 	}
-	conn := a.conn
 	a.mu.RUnlock()
 
-	// Encode as DATA message
-	msg := encodeDataMessage(data)
-
-	// Encrypt if needed
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
-		peers := a.peers.list()
-		results := make([]SendResult, len(peers))
-		for i, peer := range peers {
-			results[i] = SendResult{Addr: peer, Error: err}
-		}
-		return results
-	}
-
-	// Send to all peers
-	peers := a.peers.list()
-	results := make([]SendResult, len(peers))
+	peerConns := a.peers.connAddrs()
+	results := make([]SendResult, len(peerConns))
 
 	var wg sync.WaitGroup
-	for i, peer := range peers {
+	for i, pc := range peerConns {
 		wg.Add(1)
-		go func(idx int, addr *net.UDPAddr) {
+		go func(idx int, addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			n, err := conn.WriteToUDP(processed, addr)
-			results[idx] = SendResult{
-				Addr:  addr,
-				Sent:  n,
-				Error: err,
+			err := a.sendOnStream(conn, MsgTypeData, data)
+			sent := 0
+			if err == nil {
+				sent = len(data)
 			}
-		}(i, peer)
+			results[idx] = SendResult{Addr: addr, Sent: sent, Error: err}
+		}(i, pc.Addr, pc.Conn)
 	}
 	wg.Wait()
 
@@ -435,44 +437,36 @@ func (a *Alan) Send(data []byte) []SendResult {
 }
 
 // SendTo sends data to a specific peer.
-// This method does NOT wait for quorum - it's a direct send to a known peer.
 func (a *Alan) SendTo(addr *net.UDPAddr, data []byte) (int, error) {
 	a.mu.RLock()
 	if !a.running {
 		a.mu.RUnlock()
 		return 0, ErrNotStarted
 	}
-	conn := a.conn
 	a.mu.RUnlock()
 
-	// Encode as DATA message
-	msg := encodeDataMessage(data)
-
-	// Encrypt if needed
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
-		return 0, err
+	conn, ok := a.peers.getConn(addr)
+	if !ok {
+		return 0, ErrNoPeerConnection
 	}
 
-	return conn.WriteToUDP(processed, addr)
+	if err := a.sendOnStream(conn, MsgTypeData, data); err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 // SendAndWaitReply broadcasts a request to all peers and waits for their responses.
-// It returns all replies received before the context is cancelled or deadline exceeded.
-// If peers disconnect while waiting, they are removed from the expected responses.
-// The method returns when all remaining peers have responded or the context is done.
 func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, error) {
 	a.mu.RLock()
 	if !a.running {
 		a.mu.RUnlock()
 		return nil, ErrNotStarted
 	}
-	conn := a.conn
 	a.mu.RUnlock()
 
-	// Get current peers
-	peers := a.peers.list()
-	if len(peers) == 0 {
+	peerConns := a.peers.connAddrs()
+	if len(peerConns) == 0 {
 		return []Reply{}, nil
 	}
 
@@ -482,54 +476,49 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 		return nil, fmt.Errorf("failed to generate request ID: %w", err)
 	}
 
-	// Encode as REQUEST message
-	msg := encodeRequestMessage(requestID, data)
-
-	// Encrypt if needed
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
-		return nil, err
-	}
-
 	// Build waitingFor set
-	waitingFor := make(map[string]struct{}, len(peers))
-	for _, peer := range peers {
-		waitingFor[peer.String()] = struct{}{}
+	waitingFor := make(map[string]struct{}, len(peerConns))
+	for _, pc := range peerConns {
+		waitingFor[pc.Addr.String()] = struct{}{}
 	}
 
 	// Register pending request
 	reqKey := hex.EncodeToString(requestID)
 	pending := &pendingRequest{
-		responseChan: make(chan Reply, len(peers)+10),
+		responseChan: make(chan Reply, len(peerConns)+10),
 		waitingFor:   waitingFor,
-		peerLeftChan: make(chan *net.UDPAddr, len(peers)+10),
+		peerLeftChan: make(chan *net.UDPAddr, len(peerConns)+10),
 	}
 	a.pendingRequestsMu.Lock()
 	a.pendingRequests[reqKey] = pending
 	a.pendingRequestsMu.Unlock()
 
-	// Cleanup when done
 	defer func() {
 		a.pendingRequestsMu.Lock()
 		delete(a.pendingRequests, reqKey)
 		a.pendingRequestsMu.Unlock()
 	}()
 
-	// Send to all peers
+	// Send request to all peers via bidirectional streams.
+	// Each stream carries: REQUEST with requestID, then we read RESPONSE back.
+	// The response is routed through pending.responseChan.
+	payload := make([]byte, RequestIDSize+len(data))
+	copy(payload[:RequestIDSize], requestID)
+	copy(payload[RequestIDSize:], data)
+
 	var wg sync.WaitGroup
-	for _, peer := range peers {
+	for _, pc := range peerConns {
 		wg.Add(1)
-		go func(addr *net.UDPAddr) {
+		go func(addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			conn.WriteToUDP(processed, addr)
-		}(peer)
+			a.sendOnStream(conn, MsgTypeRequest, payload)
+		}(pc.Addr, pc.Conn)
 	}
 	wg.Wait()
 
 	// Collect responses
-	replies := make([]Reply, 0, len(peers))
+	replies := make([]Reply, 0, len(peerConns))
 	for {
-		// Check if we're done waiting for all peers
 		pending.waitingForMu.Lock()
 		remaining := len(pending.waitingFor)
 		pending.waitingForMu.Unlock()
@@ -542,7 +531,6 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 			return replies, ctx.Err()
 		case reply := <-pending.responseChan:
 			replies = append(replies, reply)
-			// Remove this peer from waitingFor
 			pending.waitingForMu.Lock()
 			delete(pending.waitingFor, reply.Addr.String())
 			remaining := len(pending.waitingFor)
@@ -551,7 +539,6 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 				return replies, nil
 			}
 		case leftAddr := <-pending.peerLeftChan:
-			// Peer disconnected, remove from waitingFor
 			pending.waitingForMu.Lock()
 			delete(pending.waitingFor, leftAddr.String())
 			remaining := len(pending.waitingFor)
@@ -564,15 +551,18 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, data []byte) ([]Reply, erro
 }
 
 // SendToAndWaitReply sends a request to a specific peer and waits for its response.
-// Returns ErrPeerDisconnected if the target peer disconnects before responding.
 func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data []byte) (*Reply, error) {
 	a.mu.RLock()
 	if !a.running {
 		a.mu.RUnlock()
 		return nil, ErrNotStarted
 	}
-	conn := a.conn
 	a.mu.RUnlock()
+
+	conn, ok := a.peers.getConn(addr)
+	if !ok {
+		return nil, ErrNoPeerConnection
+	}
 
 	// Generate random request ID
 	requestID := make([]byte, RequestIDSize)
@@ -580,16 +570,7 @@ func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data [
 		return nil, fmt.Errorf("failed to generate request ID: %w", err)
 	}
 
-	// Encode as REQUEST message
-	msg := encodeRequestMessage(requestID, data)
-
-	// Encrypt if needed
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build waitingFor set with single peer
+	// Build waitingFor
 	waitingFor := make(map[string]struct{}, 1)
 	waitingFor[addr.String()] = struct{}{}
 
@@ -604,15 +585,18 @@ func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data [
 	a.pendingRequests[reqKey] = pending
 	a.pendingRequestsMu.Unlock()
 
-	// Cleanup when done
 	defer func() {
 		a.pendingRequestsMu.Lock()
 		delete(a.pendingRequests, reqKey)
 		a.pendingRequestsMu.Unlock()
 	}()
 
-	// Send to peer
-	if _, err := conn.WriteToUDP(processed, addr); err != nil {
+	// Send request
+	payload := make([]byte, RequestIDSize+len(data))
+	copy(payload[:RequestIDSize], requestID)
+	copy(payload[RequestIDSize:], data)
+
+	if err := a.sendOnStream(conn, MsgTypeRequest, payload); err != nil {
 		return nil, err
 	}
 
@@ -628,8 +612,6 @@ func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, data [
 }
 
 // Reply sends a response to a request message.
-// This should be called from the message handler when processing a request.
-// Returns an error if the message is not a request.
 func (a *Alan) Reply(msg Message, data []byte) (int, error) {
 	if !msg.IsRequest() {
 		return 0, errors.New("cannot reply to a non-request message")
@@ -640,24 +622,25 @@ func (a *Alan) Reply(msg Message, data []byte) (int, error) {
 		a.mu.RUnlock()
 		return 0, ErrNotStarted
 	}
-	conn := a.conn
 	a.mu.RUnlock()
 
-	// Encode as RESPONSE message with the same request ID
-	respMsg := encodeResponseMessage(msg.requestID, data)
-
-	// Encrypt if needed
-	processed, err := a.processOutgoing(respMsg)
-	if err != nil {
-		return 0, err
+	// Send response via a new stream to the peer
+	conn, ok := a.peers.getConn(msg.Addr)
+	if !ok {
+		return 0, ErrNoPeerConnection
 	}
 
-	return conn.WriteToUDP(processed, msg.Addr)
+	payload := make([]byte, RequestIDSize+len(data))
+	copy(payload[:RequestIDSize], msg.requestID)
+	copy(payload[RequestIDSize:], data)
+
+	if err := a.sendOnStream(conn, MsgTypeResponse, payload); err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 // notifyPeerLeft notifies all pending requests that a peer has left.
-// This allows SendAndWaitReply and SendToAndWaitReply to return early
-// instead of waiting for responses that will never come.
 func (a *Alan) notifyPeerLeft(addr *net.UDPAddr) {
 	a.pendingRequestsMu.RLock()
 	defer a.pendingRequestsMu.RUnlock()
@@ -666,7 +649,6 @@ func (a *Alan) notifyPeerLeft(addr *net.UDPAddr) {
 	for _, pending := range a.pendingRequests {
 		pending.waitingForMu.Lock()
 		if _, waiting := pending.waitingFor[peerKey]; waiting {
-			// Non-blocking send to peerLeftChan
 			select {
 			case pending.peerLeftChan <- addr:
 			default:
@@ -686,9 +668,9 @@ func (a *Alan) PeerCount() int {
 	return a.peers.count()
 }
 
-// IsSecure returns true if encryption is enabled
+// IsSecure returns true if PSK verification is enabled
 func (a *Alan) IsSecure() bool {
-	return a.aead != nil
+	return a.config.Security.Enabled
 }
 
 // Config returns a copy of the current configuration
@@ -699,16 +681,14 @@ func (a *Alan) Config() Config {
 // LocalAddr returns the local address the server is listening on
 func (a *Alan) LocalAddr() net.Addr {
 	a.mu.RLock()
-	conn := a.conn
-	a.mu.RUnlock()
-	if conn == nil {
-		return nil
+	defer a.mu.RUnlock()
+	if a.listener != nil {
+		return a.listener.Addr()
 	}
-	return conn.LocalAddr()
+	return nil
 }
 
 // Ready returns a channel that is closed when the instance is ready to send/receive.
-// Use this to wait for Start() to complete initialization before calling Send/SendTo.
 func (a *Alan) Ready() <-chan struct{} {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -716,7 +696,6 @@ func (a *Alan) Ready() <-chan struct{} {
 }
 
 // QuorumSize returns the number of peers required for quorum.
-// Returns (Quorum/2)+1 if Quorum is set, or 0 if quorum is disabled.
 func (a *Alan) QuorumSize() int {
 	if a.config.Replicas == 0 {
 		return 0
@@ -725,7 +704,6 @@ func (a *Alan) QuorumSize() int {
 }
 
 // HasQuorum returns true if the current number of peers meets the quorum requirement.
-// Always returns true if quorum is disabled (Replicas == 0).
 func (a *Alan) HasQuorum() bool {
 	required := a.QuorumSize()
 	if required == 0 {
@@ -734,49 +712,36 @@ func (a *Alan) HasQuorum() bool {
 	return a.PeerCount() >= required
 }
 
-// HasAllPeers returns true if the current number of peers meets the full cluster membership requirement.
-// Always returns true if replicas count is disabled (Replicas == 0).
+// HasAllPeers returns true if the current number of peers meets the full cluster membership.
 func (a *Alan) HasAllPeers() bool {
 	if a.config.Replicas == 0 {
 		return true
 	}
-
 	return a.PeerCount() >= a.config.Replicas
 }
 
-// WaitAll blocks until all peers online or the context is cancelled.
-//   - If replicas count is disabled (Replicas == 0), it returns immediately.
-//   - If replicas count is enabled, this not wait just for quorum but for all peers to be present.
-//     This is useful for operations that require full cluster membership.
+// WaitAll blocks until all peers are online or the context is cancelled.
 func (a *Alan) WaitAll(ctx context.Context) error {
 	if a.config.Replicas == 0 {
 		return nil
 	}
-
 	return a.waitTicker(ctx, a.config.Replicas)
 }
 
 // WaitForQuorum blocks until quorum is reached or the context is cancelled.
-// Returns nil immediately if quorum is disabled (Quorum == 0).
-// Returns ctx.Err() if the context is cancelled before quorum is reached.
 func (a *Alan) WaitForQuorum(ctx context.Context) error {
 	if a.config.Replicas == 0 {
 		return nil
 	}
-
 	return a.waitTicker(ctx, a.QuorumSize())
 }
 
 func (a *Alan) waitTicker(ctx context.Context, required int) error {
-	// Fast path: already have quorum
 	if a.PeerCount() >= required {
 		return nil
 	}
-
-	// Poll until quorum reached
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -789,49 +754,211 @@ func (a *Alan) waitTicker(ctx context.Context, required int) error {
 	}
 }
 
-// waitForQuorum is an internal helper that blocks until quorum is reached.
-// Returns nil immediately if quorum is disabled.
 func (a *Alan) waitForQuorum(ctx context.Context) error {
 	return a.WaitForQuorum(ctx)
 }
 
-// discoverPeers resolves DNS and adds initial peers.
-// If DNSAddr is empty or DNS resolution fails, it silently returns without error.
-// Peers may be discovered later via DNS refresh or incoming messages.
-func (a *Alan) discoverPeers() error {
+// acceptLoop accepts incoming QUIC connections.
+func (a *Alan) acceptLoop() error {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return a.ctx.Err()
+		case <-a.stopChan:
+			return nil
+		default:
+		}
+
+		conn, err := a.listener.Accept(a.ctx)
+		if err != nil {
+			a.mu.RLock()
+			running := a.running
+			a.mu.RUnlock()
+			if !running {
+				return nil
+			}
+			// Context cancelled
+			if a.ctx.Err() != nil {
+				return a.ctx.Err()
+			}
+			continue
+		}
+
+		// Determine peer address
+		remoteAddr := conn.RemoteAddr()
+		udpAddr, ok := remoteAddr.(*net.UDPAddr)
+		if !ok {
+			conn.CloseWithError(1, "unsupported address type")
+			continue
+		}
+
+		// Register peer (connection = JOIN)
+		if isNew := a.peers.add(udpAddr, conn); isNew {
+			a.enqueuePeerEvent(peerEventJoin, udpAddr)
+		}
+
+		// Handle streams from this connection
+		go a.handleConnection(conn, udpAddr)
+	}
+}
+
+// handleConnection processes all incoming streams from a QUIC connection.
+// When the connection closes (peer leaves), the peer is removed.
+func (a *Alan) handleConnection(conn *quic.Conn, addr *net.UDPAddr) {
+	defer func() {
+		// Connection closed = peer left
+		if existed, _ := a.peers.remove(addr); existed {
+			a.notifyPeerLeft(addr)
+			a.removePeerQueue(addr)
+			a.enqueuePeerEvent(peerEventLeave, addr)
+		}
+	}()
+
+	for {
+		stream, err := conn.AcceptStream(a.ctx)
+		if err != nil {
+			return // connection closed or context cancelled
+		}
+
+		go a.handleStream(stream, addr)
+	}
+}
+
+// handleStream processes a single incoming QUIC stream.
+func (a *Alan) handleStream(stream *quic.Stream, addr *net.UDPAddr) {
+	defer (*stream).Close()
+
+	msgType, payload, err := readStreamMessage(stream)
+	if err != nil {
+		return
+	}
+
+	a.handleMessage(msgType, payload, addr)
+}
+
+// handleMessage processes a decoded protocol message
+func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAddr) {
+	switch msgType {
+	case MsgTypeData:
+		msg := Message{
+			Data: payload,
+			Addr: sourceAddr,
+		}
+		a.enqueueMessage(sourceAddr, msg)
+
+	case MsgTypeRequest:
+		if len(payload) < RequestIDSize {
+			return
+		}
+		requestID := payload[:RequestIDSize]
+		data := payload[RequestIDSize:]
+
+		msg := Message{
+			Data:      data,
+			Addr:      sourceAddr,
+			requestID: requestID,
+		}
+		a.enqueueMessage(sourceAddr, msg)
+
+	case MsgTypeResponse:
+		if len(payload) < RequestIDSize {
+			return
+		}
+		requestID := payload[:RequestIDSize]
+		data := payload[RequestIDSize:]
+
+		reqKey := hex.EncodeToString(requestID)
+		a.pendingRequestsMu.RLock()
+		pending, ok := a.pendingRequests[reqKey]
+		a.pendingRequestsMu.RUnlock()
+
+		if ok {
+			reply := Reply{
+				Data: data,
+				Addr: sourceAddr,
+			}
+			select {
+			case pending.responseChan <- reply:
+			default:
+			}
+		}
+
+	case MsgTypeLockRequest:
+		requestID, key, err := decodeLockPayload(payload)
+		if err != nil {
+			return
+		}
+		a.handleLockRequest(requestID, key, sourceAddr)
+
+	case MsgTypeLockGrant:
+		requestID, key, err := decodeLockPayload(payload)
+		if err != nil {
+			return
+		}
+		a.handleLockGrant(requestID, key, sourceAddr)
+
+	case MsgTypeLockDeny:
+		requestID, key, err := decodeLockPayload(payload)
+		if err != nil {
+			return
+		}
+		a.handleLockDeny(requestID, key, sourceAddr)
+
+	case MsgTypeLockRelease:
+		_, key, err := decodeLockPayload(payload)
+		if err != nil {
+			return
+		}
+		a.handleLockRelease(key, sourceAddr)
+	}
+}
+
+// discoverAndDialPeers resolves DNS and dials QUIC connections to discovered peers.
+func (a *Alan) discoverAndDialPeers() error {
 	if a.config.DNSAddr == "" {
 		return nil
 	}
 
 	ips, err := lookupIP(a.config.DNSAddr)
 	if err != nil {
-		// DNS resolution failed, but we don't fail startup
-		// Peers may resolve later via refresh
 		return nil
 	}
 
-	localAddr := a.conn.LocalAddr().(*net.UDPAddr)
+	localAddr := a.listener.Addr().(*net.UDPAddr)
 
 	for _, ip := range ips {
-		peerAddr := &net.UDPAddr{
-			IP:   ip,
-			Port: a.config.Port,
-		}
+		peerAddr := &net.UDPAddr{IP: ip, Port: a.config.Port}
 
 		// Skip self
 		if peerAddr.IP.Equal(localAddr.IP) && peerAddr.Port == localAddr.Port {
 			continue
 		}
-
-		// Also skip if it's our own IP (different check for localhost)
 		if isOwnIP(ip) && peerAddr.Port == localAddr.Port {
 			continue
 		}
 
-		a.peers.add(peerAddr)
+		go a.dialPeer(peerAddr)
 	}
 
 	return nil
+}
+
+// dialPeer establishes a QUIC connection to a peer.
+func (a *Alan) dialPeer(addr *net.UDPAddr) {
+	ctx, cancel := context.WithTimeout(a.ctx, a.config.Timeout)
+	defer cancel()
+
+	conn, err := a.transport.Dial(ctx, addr, a.clientTLS, a.quicConfig)
+	if err != nil {
+		return
+	}
+
+	if isNew := a.peers.add(addr, conn); isNew {
+		a.enqueuePeerEvent(peerEventJoin, addr)
+	}
+
+	// Handle incoming streams from this peer
+	go a.handleConnection(conn, addr)
 }
 
 // isOwnIP checks if an IP belongs to this machine
@@ -848,261 +975,6 @@ func isOwnIP(ip net.IP) bool {
 		}
 	}
 	return false
-}
-
-// listen handles incoming messages
-func (a *Alan) listen() error {
-	buffer := make([]byte, a.config.BufferSize)
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return a.ctx.Err()
-		case <-a.stopChan:
-			return nil
-		default:
-			a.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, addr, err := a.conn.ReadFromUDP(buffer)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				a.mu.RLock()
-				if !a.running {
-					a.mu.RUnlock()
-					return nil
-				}
-				a.mu.RUnlock()
-				continue
-			}
-
-			// Decrypt if needed
-			data, err := a.processIncoming(buffer[:n])
-			if err != nil {
-				// Skip messages that fail decryption
-				continue
-			}
-
-			// Decode protocol message
-			msgType, payload, err := decodeMessage(data)
-			if err != nil {
-				continue
-			}
-
-			// Handle message based on type
-			a.handleMessage(msgType, payload, addr)
-		}
-	}
-}
-
-// handleMessage processes a decoded protocol message
-func (a *Alan) handleMessage(msgType byte, payload []byte, sourceAddr *net.UDPAddr) {
-	switch msgType {
-	case MsgTypeJoin:
-		port, err := decodeControlPayload(payload)
-		if err != nil {
-			return
-		}
-		peerAddr := buildPeerAddr(sourceAddr, port)
-		if isNew := a.peers.add(peerAddr); isNew {
-			a.enqueuePeerEvent(peerEventJoin, peerAddr)
-		}
-
-	case MsgTypeLeave:
-		port, err := decodeControlPayload(payload)
-		if err != nil {
-			return
-		}
-		peerAddr := buildPeerAddr(sourceAddr, port)
-		if existed := a.peers.remove(peerAddr); existed {
-			// Notify pending requests that this peer left
-			a.notifyPeerLeft(peerAddr)
-
-			// Remove the peer's message queue
-			a.removePeerQueue(peerAddr)
-
-			a.enqueuePeerEvent(peerEventLeave, peerAddr)
-		}
-
-	case MsgTypeHeartbeat:
-		port, err := decodeControlPayload(payload)
-		if err != nil {
-			return
-		}
-		peerAddr := buildPeerAddr(sourceAddr, port)
-		// Add peer if new (in case we missed the JOIN)
-		if isNew := a.peers.add(peerAddr); isNew {
-			a.enqueuePeerEvent(peerEventJoin, peerAddr)
-		}
-
-	case MsgTypeData:
-		// Update last seen time for the peer (keeps peer alive even without heartbeats)
-		a.peers.updateLastSeen(sourceAddr)
-
-		// Copy payload to avoid buffer reuse issues
-		payloadCopy := make([]byte, len(payload))
-		copy(payloadCopy, payload)
-
-		msg := Message{
-			Data: payloadCopy,
-			Addr: sourceAddr,
-		}
-		// Enqueue for ordered processing (blocks if queue full)
-		a.enqueueMessage(sourceAddr, msg)
-
-	case MsgTypeRequest:
-		// Update last seen time for the peer
-		a.peers.updateLastSeen(sourceAddr)
-
-		requestID, data, err := decodeRequestPayload(payload)
-		if err != nil {
-			return
-		}
-
-		// Copy data to avoid buffer reuse issues
-		dataCopy := make([]byte, len(data))
-		copy(dataCopy, data)
-		requestIDCopy := make([]byte, len(requestID))
-		copy(requestIDCopy, requestID)
-
-		msg := Message{
-			Data:      dataCopy,
-			Addr:      sourceAddr,
-			requestID: requestIDCopy,
-		}
-		// Enqueue for ordered processing (blocks if queue full)
-		a.enqueueMessage(sourceAddr, msg)
-
-	case MsgTypeResponse:
-		// Update last seen time for the peer
-		a.peers.updateLastSeen(sourceAddr)
-
-		requestID, data, err := decodeRequestPayload(payload)
-		if err != nil {
-			return
-		}
-
-		// Route response to the waiting request
-		reqKey := hex.EncodeToString(requestID)
-		a.pendingRequestsMu.RLock()
-		pending, ok := a.pendingRequests[reqKey]
-		a.pendingRequestsMu.RUnlock()
-
-		if ok {
-			// Copy data to avoid buffer reuse issues
-			dataCopy := make([]byte, len(data))
-			copy(dataCopy, data)
-
-			reply := Reply{
-				Data: dataCopy,
-				Addr: sourceAddr,
-			}
-			// Non-blocking send to avoid deadlock if channel is full
-			select {
-			case pending.responseChan <- reply:
-			default:
-			}
-		}
-
-	case MsgTypeLockRequest:
-		// Update last seen time for the peer
-		a.peers.updateLastSeen(sourceAddr)
-
-		requestID, key, err := decodeLockPayload(payload)
-		if err != nil {
-			return
-		}
-
-		// Copy request ID to avoid buffer reuse issues
-		requestIDCopy := make([]byte, len(requestID))
-		copy(requestIDCopy, requestID)
-
-		a.handleLockRequest(requestIDCopy, key, sourceAddr)
-
-	case MsgTypeLockGrant:
-		// Update last seen time for the peer
-		a.peers.updateLastSeen(sourceAddr)
-
-		requestID, key, err := decodeLockPayload(payload)
-		if err != nil {
-			return
-		}
-
-		// Copy request ID to avoid buffer reuse issues
-		requestIDCopy := make([]byte, len(requestID))
-		copy(requestIDCopy, requestID)
-
-		a.handleLockGrant(requestIDCopy, key, sourceAddr)
-
-	case MsgTypeLockDeny:
-		// Update last seen time for the peer
-		a.peers.updateLastSeen(sourceAddr)
-
-		requestID, key, err := decodeLockPayload(payload)
-		if err != nil {
-			return
-		}
-
-		// Copy request ID to avoid buffer reuse issues
-		requestIDCopy := make([]byte, len(requestID))
-		copy(requestIDCopy, requestID)
-
-		a.handleLockDeny(requestIDCopy, key, sourceAddr)
-
-	case MsgTypeLockRelease:
-		// Update last seen time for the peer
-		a.peers.updateLastSeen(sourceAddr)
-
-		_, key, err := decodeLockPayload(payload)
-		if err != nil {
-			return
-		}
-
-		a.handleLockRelease(key, sourceAddr)
-	}
-}
-
-// broadcastControl sends a control message to all peers
-func (a *Alan) broadcastControl(msgType byte) {
-	localAddr := a.conn.LocalAddr().(*net.UDPAddr)
-	msg := encodeControlMessage(msgType, localAddr.Port)
-
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
-		return
-	}
-
-	for _, peer := range a.peers.list() {
-		a.conn.WriteToUDP(processed, peer)
-	}
-}
-
-// heartbeatLoop periodically sends heartbeats and removes stale peers
-func (a *Alan) heartbeatLoop() {
-	ticker := time.NewTicker(a.config.HeartbeatInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-a.stopChan:
-			return
-		case <-ticker.C:
-			// Send heartbeat to all peers
-			a.broadcastControl(MsgTypeHeartbeat)
-
-			// Remove stale peers
-			removed := a.peers.removeStale(a.config.HeartbeatTimeout)
-
-			// Notify pending requests, remove queues, and enqueue leave events
-			for _, addr := range removed {
-				a.notifyPeerLeft(addr)
-				a.removePeerQueue(addr)
-				a.enqueuePeerEvent(peerEventLeave, addr)
-			}
-		}
-	}
 }
 
 // refreshLoop periodically re-resolves DNS to discover new peers
@@ -1123,7 +995,6 @@ func (a *Alan) refreshLoop() {
 }
 
 // Refresh re-resolves DNS and discovers new peers.
-// If DNSAddr is empty or DNS resolution fails, it returns nil without error.
 func (a *Alan) Refresh() error {
 	if a.config.DNSAddr == "" {
 		return nil
@@ -1131,44 +1002,33 @@ func (a *Alan) Refresh() error {
 
 	ips, err := lookupIP(a.config.DNSAddr)
 	if err != nil {
-		// DNS resolution failed, but we don't fail
-		// It may resolve later
 		return nil
 	}
 
-	localAddr := a.conn.LocalAddr().(*net.UDPAddr)
+	localAddr := a.listener.Addr().(*net.UDPAddr)
 
 	for _, ip := range ips {
-		peerAddr := &net.UDPAddr{
-			IP:   ip,
-			Port: a.config.Port,
-		}
+		peerAddr := &net.UDPAddr{IP: ip, Port: a.config.Port}
 
-		// Skip self
 		if isOwnIP(ip) && peerAddr.Port == localAddr.Port {
 			continue
 		}
 
-		// Add peer if new
-		if isNew := a.peers.add(peerAddr); isNew {
-			// Send JOIN to new peer
-			msg := encodeControlMessage(MsgTypeJoin, localAddr.Port)
-			processed, _ := a.processOutgoing(msg)
-			a.conn.WriteToUDP(processed, peerAddr)
-
-			a.enqueuePeerEvent(peerEventJoin, peerAddr)
+		// Check if we already have this peer
+		if _, exists := a.peers.get(peerAddr); exists {
+			continue
 		}
+
+		go a.dialPeer(peerAddr)
 	}
 
 	return nil
 }
 
 // getOrCreatePeerQueue returns the message queue for a peer, creating one if it doesn't exist.
-// The queue ensures messages from the same peer are processed in order.
 func (a *Alan) getOrCreatePeerQueue(addr *net.UDPAddr) *peerQueue {
 	key := addr.String()
 
-	// Fast path: check if queue already exists
 	a.peerQueuesMu.RLock()
 	pq, exists := a.peerQueues[key]
 	a.peerQueuesMu.RUnlock()
@@ -1176,16 +1036,13 @@ func (a *Alan) getOrCreatePeerQueue(addr *net.UDPAddr) *peerQueue {
 		return pq
 	}
 
-	// Slow path: create new queue
 	a.peerQueuesMu.Lock()
 	defer a.peerQueuesMu.Unlock()
 
-	// Double-check after acquiring write lock
 	if pq, exists = a.peerQueues[key]; exists {
 		return pq
 	}
 
-	// Create new queue with its own context
 	ctx, cancel := context.WithCancel(a.ctx)
 	pq = &peerQueue{
 		ch:     make(chan Message, a.config.MessageQueueSize),
@@ -1193,14 +1050,12 @@ func (a *Alan) getOrCreatePeerQueue(addr *net.UDPAddr) *peerQueue {
 	}
 	a.peerQueues[key] = pq
 
-	// Start worker goroutine for this peer
 	go a.peerWorker(ctx, pq)
 
 	return pq
 }
 
 // removePeerQueue closes and removes the message queue for a peer.
-// Any pending messages in the queue are discarded.
 func (a *Alan) removePeerQueue(addr *net.UDPAddr) {
 	key := addr.String()
 
@@ -1212,12 +1067,11 @@ func (a *Alan) removePeerQueue(addr *net.UDPAddr) {
 	a.peerQueuesMu.Unlock()
 
 	if exists && pq != nil {
-		pq.cancel() // Signal worker to stop
+		pq.cancel()
 	}
 }
 
 // closeAllPeerQueues closes all peer message queues.
-// Called during shutdown.
 func (a *Alan) closeAllPeerQueues() {
 	a.peerQueuesMu.Lock()
 	defer a.peerQueuesMu.Unlock()
@@ -1229,21 +1083,16 @@ func (a *Alan) closeAllPeerQueues() {
 }
 
 // enqueueMessage adds a message to the peer's queue for ordered processing.
-// Blocks if the queue is full (backpressure).
 func (a *Alan) enqueueMessage(addr *net.UDPAddr, msg Message) {
 	pq := a.getOrCreatePeerQueue(addr)
 
-	// Block if queue is full - this provides backpressure
 	select {
 	case pq.ch <- msg:
-		// Message queued successfully
 	case <-a.ctx.Done():
-		// Shutting down, discard message
 	}
 }
 
 // peerWorker processes messages from a peer's queue in order.
-// One worker goroutine runs per peer.
 func (a *Alan) peerWorker(ctx context.Context, pq *peerQueue) {
 	for {
 		select {
@@ -1265,14 +1114,11 @@ func (a *Alan) peerWorker(ctx context.Context, pq *peerQueue) {
 	}
 }
 
-// enqueuePeerEvent adds a peer join/leave event to the queue for ordered processing.
-// Blocks if the queue is full (backpressure).
+// enqueuePeerEvent adds a peer join/leave event to the queue.
 func (a *Alan) enqueuePeerEvent(eventType peerEventType, addr *net.UDPAddr) {
 	select {
 	case a.peerEventCh <- peerEvent{eventType: eventType, addr: addr}:
-		// Event queued successfully
 	case <-a.ctx.Done():
-		// Shutting down, discard event
 	}
 }
 
@@ -1287,7 +1133,6 @@ func (a *Alan) peerEventWorker(ctx context.Context) {
 				return
 			}
 
-			// Handle auto-release of locks on peer leave
 			if event.eventType == peerEventLeave {
 				a.releaseLocksHeldBy(event.addr)
 			}

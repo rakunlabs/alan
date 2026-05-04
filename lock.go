@@ -5,54 +5,45 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net"
+	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 // Lock acquires a named distributed lock, blocking until acquired or context cancelled.
-// If quorum is enabled, it waits for quorum before attempting to acquire the lock.
-// Returns nil on success, ctx.Err() if context is cancelled.
 func (a *Alan) Lock(ctx context.Context, key string) error {
-	// Wait for quorum if enabled
 	if err := a.waitForQuorum(ctx); err != nil {
 		return err
 	}
 
 	for {
-		// Try to acquire the lock
 		acquired, waitCh := a.tryAcquireLock(ctx, key)
 		if acquired {
 			return nil
 		}
 
-		// Wait for lock release or context cancellation
 		if waitCh != nil {
 			select {
 			case <-ctx.Done():
-				// Remove ourselves from waiters
 				a.removeWaiter(key, waitCh)
 				return ctx.Err()
 			case <-waitCh:
-				// Lock was released, retry
 				continue
 			}
 		}
 
-		// No wait channel means context was cancelled during tryAcquireLock
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			// Small delay before retry to avoid tight loop
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
 
 // TryLock attempts to acquire a named distributed lock without blocking.
-// Returns true if the lock was acquired, false otherwise.
-// If quorum is enabled and not met, returns false.
 func (a *Alan) TryLock(key string) bool {
-	// Check quorum if enabled
 	if !a.HasQuorum() {
 		return false
 	}
@@ -65,22 +56,18 @@ func (a *Alan) TryLock(key string) bool {
 }
 
 // Unlock releases a named distributed lock.
-// Returns ErrLockNotHeld if this instance does not hold the lock.
 func (a *Alan) Unlock(key string) error {
 	a.locksMu.Lock()
 	state, exists := a.locks[key]
 	if !exists || state.holder != nil {
-		// Lock doesn't exist or is held by another peer (not us)
 		a.locksMu.Unlock()
 		return ErrLockNotHeld
 	}
 
-	// We hold the lock (holder == nil means local), release it
 	waiters := state.waiters
 	delete(a.locks, key)
 	a.locksMu.Unlock()
 
-	// Notify local waiters
 	for _, ch := range waiters {
 		select {
 		case ch <- struct{}{}:
@@ -88,42 +75,32 @@ func (a *Alan) Unlock(key string) error {
 		}
 	}
 
-	// Broadcast release to all peers
 	a.broadcastLockRelease(key)
 
 	return nil
 }
 
 // tryAcquireLock attempts to acquire a lock.
-// Returns (true, nil) if acquired.
-// Returns (false, waitCh) if denied - caller should wait on waitCh for release notification.
-// Returns (false, nil) if context was cancelled.
 func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struct{}) {
 	a.locksMu.Lock()
 
-	// Check if lock already exists locally
 	state, exists := a.locks[key]
 	if exists {
 		if state.holder == nil {
-			// We already hold this lock
 			a.locksMu.Unlock()
 			return true, nil
 		}
-		// Another peer holds it, add ourselves as waiter
 		waitCh := make(chan struct{}, 1)
 		state.waiters = append(state.waiters, waitCh)
 		a.locksMu.Unlock()
 		return false, waitCh
 	}
 
-	// Lock doesn't exist locally, need to request from peers
 	a.locksMu.Unlock()
 
-	peers := a.peers.list()
-	if len(peers) == 0 {
-		// No peers, acquire locally
+	peerConns := a.peers.connAddrs()
+	if len(peerConns) == 0 {
 		a.locksMu.Lock()
-		// Double-check no one else created it
 		if state, exists := a.locks[key]; exists {
 			if state.holder == nil {
 				a.locksMu.Unlock()
@@ -145,11 +122,10 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 		return false, nil
 	}
 
-	// Register pending lock request
 	reqKey := hex.EncodeToString(requestID)
 	pending := &pendingLock{
-		grantCh: make(chan *net.UDPAddr, len(peers)),
-		denyCh:  make(chan *net.UDPAddr, len(peers)),
+		grantCh: make(chan *net.UDPAddr, len(peerConns)),
+		denyCh:  make(chan *net.UDPAddr, len(peerConns)),
 	}
 	a.pendingLocksMu.Lock()
 	a.pendingLocks[reqKey] = pending
@@ -161,12 +137,11 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 		a.pendingLocksMu.Unlock()
 	}()
 
-	// Broadcast lock request
+	// Broadcast lock request over QUIC streams
 	a.broadcastLockRequest(requestID, key)
 
-	// Wait for responses from all peers
 	grants := 0
-	needed := len(peers)
+	needed := len(peerConns)
 
 	for grants < needed {
 		select {
@@ -175,12 +150,10 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 		case <-pending.grantCh:
 			grants++
 		case <-pending.denyCh:
-			// Someone denied, we need to wait for release
 			a.locksMu.Lock()
 			state, exists := a.locks[key]
 			if !exists {
-				// Create state to track the remote holder
-				state = &lockState{holder: nil, waiters: nil} // holder will be set when we get the response
+				state = &lockState{holder: nil, waiters: nil}
 				a.locks[key] = state
 			}
 			waitCh := make(chan struct{}, 1)
@@ -190,11 +163,8 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 		}
 	}
 
-	// All peers granted, acquire locally
 	a.locksMu.Lock()
-	// Check if someone else got it while we were waiting
 	if state, exists := a.locks[key]; exists && state.holder == nil {
-		// We already hold it (shouldn't happen but handle it)
 		a.locksMu.Unlock()
 		return true, nil
 	}
@@ -222,55 +192,54 @@ func (a *Alan) removeWaiter(key string, waitCh chan struct{}) {
 	}
 }
 
-// broadcastLockRequest sends a lock request to all peers
+// broadcastLockRequest sends a lock request to all peers via QUIC streams.
 func (a *Alan) broadcastLockRequest(requestID []byte, key string) {
-	msg := encodeLockMessage(MsgTypeLockRequest, requestID, key)
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
-		return
-	}
+	payload := encodeLockPayload(requestID, key)
 
-	a.mu.RLock()
-	conn := a.conn
-	a.mu.RUnlock()
-
-	for _, peer := range a.peers.list() {
-		conn.WriteToUDP(processed, peer)
+	peerConns := a.peers.connAddrs()
+	var wg sync.WaitGroup
+	for _, pc := range peerConns {
+		wg.Add(1)
+		go func(pc struct {
+			Addr *net.UDPAddr
+			Conn *quic.Conn
+		}) {
+			defer wg.Done()
+			a.sendOnStream(pc.Conn, MsgTypeLockRequest, payload)
+		}(pc)
 	}
+	wg.Wait()
 }
 
-// broadcastLockRelease sends a lock release notification to all peers
+// broadcastLockRelease sends a lock release notification to all peers via QUIC streams.
 func (a *Alan) broadcastLockRelease(key string) {
-	// Use a zero request ID for release notifications
 	requestID := make([]byte, RequestIDSize)
-	msg := encodeLockMessage(MsgTypeLockRelease, requestID, key)
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
-		return
-	}
+	payload := encodeLockPayload(requestID, key)
 
-	a.mu.RLock()
-	conn := a.conn
-	a.mu.RUnlock()
-
-	for _, peer := range a.peers.list() {
-		conn.WriteToUDP(processed, peer)
+	peerConns := a.peers.connAddrs()
+	var wg sync.WaitGroup
+	for _, pc := range peerConns {
+		wg.Add(1)
+		go func(pc struct {
+			Addr *net.UDPAddr
+			Conn *quic.Conn
+		}) {
+			defer wg.Done()
+			a.sendOnStream(pc.Conn, MsgTypeLockRelease, payload)
+		}(pc)
 	}
+	wg.Wait()
 }
 
-// sendLockResponse sends a lock grant or deny response to a peer
+// sendLockResponse sends a lock grant or deny response to a peer via QUIC stream.
 func (a *Alan) sendLockResponse(msgType byte, requestID []byte, key string, addr *net.UDPAddr) {
-	msg := encodeLockResponseMessage(msgType, requestID, key)
-	processed, err := a.processOutgoing(msg)
-	if err != nil {
+	conn, ok := a.peers.getConn(addr)
+	if !ok {
 		return
 	}
 
-	a.mu.RLock()
-	conn := a.conn
-	a.mu.RUnlock()
-
-	conn.WriteToUDP(processed, addr)
+	payload := encodeLockPayload(requestID, key)
+	a.sendOnStream(conn, msgType, payload)
 }
 
 // releaseLocksHeldBy releases all locks held by a specific peer (called on peer leave)
@@ -281,11 +250,9 @@ func (a *Alan) releaseLocksHeldBy(addr *net.UDPAddr) {
 	peerKey := addr.String()
 	for key, state := range a.locks {
 		if state.holder != nil && state.holder.String() == peerKey {
-			// This peer held the lock, release it
 			waiters := state.waiters
 			delete(a.locks, key)
 
-			// Notify waiters
 			for _, ch := range waiters {
 				select {
 				case ch <- struct{}{}:
@@ -303,19 +270,16 @@ func (a *Alan) handleLockRequest(requestID []byte, key string, sourceAddr *net.U
 
 	state, exists := a.locks[key]
 	if !exists {
-		// Lock is free, grant it and record the holder
 		a.locks[key] = &lockState{holder: sourceAddr, waiters: nil}
 		a.sendLockResponse(MsgTypeLockGrant, requestID, key, sourceAddr)
 		return
 	}
 
 	if state.holder == nil {
-		// We hold the lock locally, deny
 		a.sendLockResponse(MsgTypeLockDeny, requestID, key, sourceAddr)
 		return
 	}
 
-	// Another peer holds it, deny
 	a.sendLockResponse(MsgTypeLockDeny, requestID, key, sourceAddr)
 }
 
@@ -339,15 +303,12 @@ func (a *Alan) handleLockGrant(requestID []byte, _ string, sourceAddr *net.UDPAd
 func (a *Alan) handleLockDeny(requestID []byte, key string, sourceAddr *net.UDPAddr) {
 	reqKey := hex.EncodeToString(requestID)
 
-	// Record that this peer holds the lock
 	a.locksMu.Lock()
 	state, exists := a.locks[key]
 	if !exists {
 		state = &lockState{holder: sourceAddr, waiters: nil}
 		a.locks[key] = state
 	} else if state.holder == nil {
-		// We thought we had it but someone else does? Shouldn't happen.
-		// Update holder to be safe
 		state.holder = sourceAddr
 	}
 	a.locksMu.Unlock()
@@ -373,13 +334,11 @@ func (a *Alan) handleLockRelease(key string, sourceAddr *net.UDPAddr) {
 		return
 	}
 
-	// Only release if this peer was the holder
 	if state.holder != nil && state.holder.String() == sourceAddr.String() {
 		waiters := state.waiters
 		delete(a.locks, key)
 		a.locksMu.Unlock()
 
-		// Notify waiters
 		for _, ch := range waiters {
 			select {
 			case ch <- struct{}{}:

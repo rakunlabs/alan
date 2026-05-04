@@ -4,12 +4,16 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 // Peer represents a remote peer in the cluster
 type Peer struct {
 	Addr     *net.UDPAddr
 	LastSeen time.Time
+	// conn is the QUIC connection to this peer (may be nil if not yet established)
+	conn *quic.Conn
 }
 
 // peerKey generates a unique key for a peer based on IP and Port
@@ -30,46 +34,54 @@ func newPeers() *peers {
 	}
 }
 
-// add adds or updates a peer
-func (p *peers) add(addr *net.UDPAddr) (isNew bool) {
+// add adds or updates a peer. If conn is non-nil, it updates the connection too.
+func (p *peers) add(addr *net.UDPAddr, conn *quic.Conn) (isNew bool) {
 	key := peerKey(addr)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if _, exists := p.items[key]; !exists {
+	if existing, exists := p.items[key]; !exists {
 		p.items[key] = &Peer{
 			Addr:     addr,
 			LastSeen: time.Now(),
+			conn:     conn,
 		}
 		return true
+	} else {
+		existing.LastSeen = time.Now()
+		if conn != nil {
+			existing.conn = conn
+		}
+		return false
 	}
-
-	p.items[key].LastSeen = time.Now()
-	return false
 }
 
-// remove removes a peer
-func (p *peers) remove(addr *net.UDPAddr) (existed bool) {
-	key := peerKey(addr)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if _, exists := p.items[key]; exists {
-		delete(p.items, key)
-		return true
-	}
-	return false
-}
-
-// updateLastSeen updates the last seen time for a peer
-func (p *peers) updateLastSeen(addr *net.UDPAddr) {
+// remove removes a peer and returns the QUIC connection (if any) for cleanup.
+func (p *peers) remove(addr *net.UDPAddr) (existed bool, conn *quic.Conn) {
 	key := peerKey(addr)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if peer, exists := p.items[key]; exists {
-		peer.LastSeen = time.Now()
+		conn = peer.conn
+		delete(p.items, key)
+		return true, conn
 	}
+	return false, nil
+}
+
+// removeByKey removes a peer by key and returns its info.
+func (p *peers) removeByKey(key string) (addr *net.UDPAddr, conn *quic.Conn, existed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if peer, exists := p.items[key]; exists {
+		addr = peer.Addr
+		conn = peer.conn
+		delete(p.items, key)
+		return addr, conn, true
+	}
+	return nil, nil, false
 }
 
 // get returns a peer by address
@@ -80,6 +92,30 @@ func (p *peers) get(addr *net.UDPAddr) (*Peer, bool) {
 
 	peer, exists := p.items[key]
 	return peer, exists
+}
+
+// getConn returns the QUIC connection for a peer, if it exists.
+func (p *peers) getConn(addr *net.UDPAddr) (*quic.Conn, bool) {
+	key := peerKey(addr)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	peer, exists := p.items[key]
+	if !exists || peer.conn == nil {
+		return nil, false
+	}
+	return peer.conn, true
+}
+
+// setConn sets the QUIC connection for an existing peer.
+func (p *peers) setConn(addr *net.UDPAddr, conn *quic.Conn) {
+	key := peerKey(addr)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if peer, exists := p.items[key]; exists {
+		peer.conn = conn
+	}
 }
 
 // list returns all peer addresses
@@ -101,21 +137,39 @@ func (p *peers) count() int {
 	return len(p.items)
 }
 
-// removeStale removes peers that haven't been seen within the timeout
-// and returns the list of removed peer addresses
-func (p *peers) removeStale(timeout time.Duration) []*net.UDPAddr {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// allConns returns all QUIC connections (for broadcasting).
+func (p *peers) allConns() []*quic.Conn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
-	var removed []*net.UDPAddr
-	now := time.Now()
-
-	for key, peer := range p.items {
-		if now.Sub(peer.LastSeen) > timeout {
-			removed = append(removed, peer.Addr)
-			delete(p.items, key)
+	conns := make([]*quic.Conn, 0, len(p.items))
+	for _, peer := range p.items {
+		if peer.conn != nil {
+			conns = append(conns, peer.conn)
 		}
 	}
+	return conns
+}
 
-	return removed
+// connAddrs returns all peers with their connections.
+func (p *peers) connAddrs() []struct {
+	Addr *net.UDPAddr
+	Conn *quic.Conn
+} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	result := make([]struct {
+		Addr *net.UDPAddr
+		Conn *quic.Conn
+	}, 0, len(p.items))
+	for _, peer := range p.items {
+		if peer.conn != nil {
+			result = append(result, struct {
+				Addr *net.UDPAddr
+				Conn *quic.Conn
+			}{Addr: peer.Addr, Conn: peer.conn})
+		}
+	}
+	return result
 }

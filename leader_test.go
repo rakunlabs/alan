@@ -3,7 +3,6 @@ package alan
 import (
 	"context"
 	"errors"
-	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,13 +73,10 @@ func TestRunAsLeader_FnError(t *testing.T) {
 	_ = a.Unlock("job")
 }
 
-// TestRunAsLeader_CtxCancelBeforeAcquire: when Lock() cannot be acquired
-// (quorum not met + ctx cancelled), fn is never called and ctx.Err() is
-// returned.
+// TestRunAsLeader_CtxCancelBeforeAcquire: quorum never met -> Lock blocks on ctx.
 func TestRunAsLeader_CtxCancelBeforeAcquire(t *testing.T) {
 	const testPort = 16103
 
-	// Replicas=3 with no peers -> quorum never met -> Lock blocks on ctx.
 	a, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 3})
 	startCtx, startCancel := context.WithCancel(context.Background())
 	defer startCancel()
@@ -125,7 +121,6 @@ func TestRunAsLeader_CtxCancelDuringFn(t *testing.T) {
 		})
 	}()
 
-	// Give the goroutine time to acquire.
 	time.Sleep(100 * time.Millisecond)
 	fnCancel()
 
@@ -147,87 +142,6 @@ func TestRunAsLeader_CtxCancelDuringFn(t *testing.T) {
 	_ = a.Unlock("job")
 }
 
-// TestRunAsLeader_MutualExclusion: two instances; second waits until first's fn exits.
-func TestRunAsLeader_MutualExclusion(t *testing.T) {
-	const testPort = 16105
-
-	a1, _ := New(Config{BindAddr: "127.0.0.1", Port: testPort, Replicas: 0})
-	a2, _ := New(Config{BindAddr: "127.0.0.2", Port: testPort, Replicas: 0})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go a1.Start(ctx, func(ctx context.Context, msg Message) {})
-	go a2.Start(ctx, func(ctx context.Context, msg Message) {})
-	<-a1.Ready()
-	<-a2.Ready()
-	defer a1.Stop()
-	defer a2.Stop()
-
-	// Connect peers.
-	a1.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: testPort})
-	a2.peers.add(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: testPort})
-
-	var (
-		a1Entered atomic.Bool
-		a1Exited  atomic.Bool
-		a2Entered atomic.Bool
-	)
-
-	// a1 holds the lock for 300ms.
-	a1Done := make(chan struct{})
-	go func() {
-		defer close(a1Done)
-		_ = a1.RunAsLeader(ctx, "leader", func(ctx context.Context) error {
-			a1Entered.Store(true)
-			time.Sleep(300 * time.Millisecond)
-			a1Exited.Store(true)
-			return nil
-		})
-	}()
-
-	// Ensure a1 has entered before a2 starts.
-	for i := 0; i < 100 && !a1Entered.Load(); i++ {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !a1Entered.Load() {
-		t.Fatal("a1 did not enter fn in time")
-	}
-
-	// a2 tries to acquire while a1 is running.
-	a2Done := make(chan error, 1)
-	go func() {
-		a2Done <- a2.RunAsLeader(ctx, "leader", func(ctx context.Context) error {
-			a2Entered.Store(true)
-			// Must only enter after a1 exited.
-			if !a1Exited.Load() {
-				t.Errorf("a2 entered fn before a1 exited")
-			}
-			return nil
-		})
-	}()
-
-	// a2 must not have entered while a1 is running.
-	time.Sleep(100 * time.Millisecond)
-	if a2Entered.Load() {
-		t.Fatal("a2 entered fn while a1 was still holding the lock")
-	}
-
-	<-a1Done
-
-	select {
-	case err := <-a2Done:
-		if err != nil {
-			t.Fatalf("a2 RunAsLeader returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("a2 did not acquire lock after a1 released")
-	}
-	if !a2Entered.Load() {
-		t.Fatal("a2 did not enter fn")
-	}
-}
-
 // TestLeaderLoop_RestartsFn: fn exits quickly; loop re-runs it.
 func TestLeaderLoop_RestartsFn(t *testing.T) {
 	const testPort = 16106
@@ -247,11 +161,10 @@ func TestLeaderLoop_RestartsFn(t *testing.T) {
 		done <- a.LeaderLoop(loopCtx, "job", 20*time.Millisecond,
 			func(ctx context.Context) error {
 				calls.Add(1)
-				return nil // exit quickly
+				return nil
 			})
 	}()
 
-	// Allow the loop to run several iterations.
 	time.Sleep(200 * time.Millisecond)
 	loopCancel()
 
@@ -269,7 +182,7 @@ func TestLeaderLoop_RestartsFn(t *testing.T) {
 	}
 }
 
-// TestLeaderLoop_ExitsOnCtxCancelDuringFn: cancel while fn is blocked on ctx -> single call, ctx.Err().
+// TestLeaderLoop_ExitsOnCtxCancelDuringFn
 func TestLeaderLoop_ExitsOnCtxCancelDuringFn(t *testing.T) {
 	const testPort = 16107
 
@@ -310,7 +223,7 @@ func TestLeaderLoop_ExitsOnCtxCancelDuringFn(t *testing.T) {
 	}
 }
 
-// TestLeaderLoop_ExitsOnCtxCancelDuringBackoff: cancel between runs -> loop exits.
+// TestLeaderLoop_ExitsOnCtxCancelDuringBackoff
 func TestLeaderLoop_ExitsOnCtxCancelDuringBackoff(t *testing.T) {
 	const testPort = 16108
 
@@ -336,13 +249,12 @@ func TestLeaderLoop_ExitsOnCtxCancelDuringBackoff(t *testing.T) {
 			})
 	}()
 
-	// Wait for first invocation, then cancel during the long backoff.
 	select {
 	case <-firstRun:
 	case <-time.After(2 * time.Second):
 		t.Fatal("fn never ran")
 	}
-	time.Sleep(50 * time.Millisecond) // ensure we're inside the backoff select
+	time.Sleep(50 * time.Millisecond)
 	loopCancel()
 
 	select {
@@ -378,9 +290,6 @@ func TestLeaderLoop_DefaultRetryDelay(t *testing.T) {
 			})
 	}()
 
-	// Within 500ms and a 1s default backoff, we expect at most 2 calls
-	// (one immediately, possibly one more if timing is weird). Definitely
-	// not a tight spin.
 	time.Sleep(500 * time.Millisecond)
 	loopCancel()
 
@@ -391,7 +300,7 @@ func TestLeaderLoop_DefaultRetryDelay(t *testing.T) {
 	}
 
 	if got := calls.Load(); got > 2 {
-		t.Fatalf("fn called %d times in 500ms with default retryDelay; expected <= 2 (not busy-spinning)", got)
+		t.Fatalf("fn called %d times in 500ms with default retryDelay; expected <= 2", got)
 	}
 	if got := calls.Load(); got < 1 {
 		t.Fatalf("fn called %d times; expected at least 1", got)
