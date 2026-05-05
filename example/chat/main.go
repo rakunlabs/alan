@@ -269,7 +269,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Send message to all peers
 				chatMsg := ChatMessage{Name: m.myName, Text: text}
 				data, _ := json.Marshal(chatMsg)
-				m.alan.Send("", data)
+				m.alan.Send(m.ctx, "", data)
 
 				// Add to local display
 				m.messages = append(m.messages, displayMessage{

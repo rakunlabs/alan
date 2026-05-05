@@ -3,14 +3,18 @@ package alan
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// Test key for encryption
+// Test key for cluster admission
 var testKey = []byte("my-secret-key")
 
 func TestNew(t *testing.T) {
@@ -79,52 +83,135 @@ func TestNew(t *testing.T) {
 		if a.config.MessageQueueSize != 256 {
 			t.Errorf("expected default message queue size 256, got %d", a.config.MessageQueueSize)
 		}
+		if a.config.MaxMessageSize != defaultMaxMessageSize {
+			t.Errorf("expected default max message size %d, got %d", defaultMaxMessageSize, a.config.MaxMessageSize)
+		}
+		if a.config.MessageQueueBytes != defaultMessageQueueBytes {
+			t.Errorf("expected default message queue bytes %d, got %d", defaultMessageQueueBytes, a.config.MessageQueueBytes)
+		}
+		if a.config.StreamOpenTimeout != defaultStreamOpenTimeout {
+			t.Errorf("expected default stream open timeout %v, got %v", defaultStreamOpenTimeout, a.config.StreamOpenTimeout)
+		}
 	})
 }
 
 func TestProtocolEncoding(t *testing.T) {
-	t.Run("stream framing roundtrip", func(t *testing.T) {
-		// Test writeStreamMessage / readStreamMessage via a pipe
-		pr, pw := net.Pipe()
-		defer pr.Close()
-		defer pw.Close()
+	t.Run("data header roundtrip", func(t *testing.T) {
+		// writeDataHeader writes [MsgTypeData][TypeLen][Type]; on the read side
+		// the MsgType byte is consumed first by readMsgType.
+		var buf bytes.Buffer
+		if err := writeDataHeader(&buf, "my.type"); err != nil {
+			t.Fatalf("writeDataHeader: %v", err)
+		}
+		if _, err := buf.WriteString("payload"); err != nil {
+			t.Fatalf("write payload: %v", err)
+		}
 
-		payload := []byte("Hello, World!")
-
-		go func() {
-			writeStreamMessage(pw, MsgTypeData, payload)
-			pw.Close()
-		}()
-
-		msgType, got, err := readStreamMessage(pr)
+		got, err := readMsgType(&buf)
 		if err != nil {
-			t.Fatalf("readStreamMessage failed: %v", err)
+			t.Fatalf("readMsgType: %v", err)
 		}
-		if msgType != MsgTypeData {
-			t.Errorf("expected type %d, got %d", MsgTypeData, msgType)
+		if got != MsgTypeData {
+			t.Errorf("type byte = %x, want %x", got, MsgTypeData)
 		}
-		if !bytes.Equal(got, payload) {
-			t.Errorf("payload mismatch: got %q, want %q", got, payload)
+		mt, err := readDataHeader(&buf)
+		if err != nil {
+			t.Fatalf("readDataHeader: %v", err)
+		}
+		if mt != "my.type" {
+			t.Errorf("type = %q, want %q", mt, "my.type")
+		}
+		body, err := io.ReadAll(&buf)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if string(body) != "payload" {
+			t.Errorf("body = %q, want %q", body, "payload")
 		}
 	})
 
-	t.Run("lock payload encoding", func(t *testing.T) {
-		requestID := make([]byte, RequestIDSize)
-		for i := range requestID {
-			requestID[i] = byte(i)
+	t.Run("request frame roundtrip", func(t *testing.T) {
+		var buf bytes.Buffer
+		reqID := bytes.Repeat([]byte{0xAB}, RequestIDSize)
+		if err := writeRequestFrame(&buf, reqID, "rpc.echo", []byte("hello")); err != nil {
+			t.Fatalf("writeRequestFrame: %v", err)
 		}
-		key := "my-lock"
-
-		payload := encodeLockPayload(requestID, key)
-		gotID, gotKey, err := decodeLockPayload(payload)
+		mt, err := readMsgType(&buf)
 		if err != nil {
-			t.Fatalf("decodeLockPayload failed: %v", err)
+			t.Fatalf("readMsgType: %v", err)
 		}
-		if !bytes.Equal(gotID, requestID) {
-			t.Errorf("requestID mismatch")
+		if mt != MsgTypeRequest {
+			t.Errorf("msgType = %x, want %x", mt, MsgTypeRequest)
 		}
-		if gotKey != key {
-			t.Errorf("key mismatch: got %q, want %q", gotKey, key)
+		gotID, gotType, gotBody, err := readRequestFrame(&buf, 1024)
+		if err != nil {
+			t.Fatalf("readRequestFrame: %v", err)
+		}
+		if !bytes.Equal(gotID, reqID) {
+			t.Errorf("reqID mismatch")
+		}
+		if gotType != "rpc.echo" {
+			t.Errorf("type = %q", gotType)
+		}
+		if string(gotBody) != "hello" {
+			t.Errorf("body = %q", gotBody)
+		}
+	})
+
+	t.Run("request frame oversize rejected", func(t *testing.T) {
+		var buf bytes.Buffer
+		reqID := bytes.Repeat([]byte{0xCD}, RequestIDSize)
+		if err := writeRequestFrame(&buf, reqID, "t", make([]byte, 1024)); err != nil {
+			t.Fatalf("writeRequestFrame: %v", err)
+		}
+		_, _ = readMsgType(&buf) // consume type byte
+		_, _, _, err := readRequestFrame(&buf, 100)
+		if !errors.Is(err, ErrFrameTooLarge) {
+			t.Errorf("expected ErrFrameTooLarge, got %v", err)
+		}
+	})
+
+	t.Run("response frame roundtrip", func(t *testing.T) {
+		var buf bytes.Buffer
+		reqID := bytes.Repeat([]byte{0xEF}, RequestIDSize)
+		if err := writeResponseFrame(&buf, reqID, []byte("response")); err != nil {
+			t.Fatalf("writeResponseFrame: %v", err)
+		}
+		mt, _ := readMsgType(&buf)
+		if mt != MsgTypeResponse {
+			t.Errorf("msgType = %x", mt)
+		}
+		gotID, gotBody, err := readResponseFrame(&buf, 1024)
+		if err != nil {
+			t.Fatalf("readResponseFrame: %v", err)
+		}
+		if !bytes.Equal(gotID, reqID) {
+			t.Errorf("reqID mismatch")
+		}
+		if string(gotBody) != "response" {
+			t.Errorf("body = %q", gotBody)
+		}
+	})
+
+	t.Run("lock frame roundtrip", func(t *testing.T) {
+		var buf bytes.Buffer
+		reqID := bytes.Repeat([]byte{0x12}, RequestIDSize)
+		if err := writeLockFrame(&buf, MsgTypeLockRequest, reqID, "my-lock"); err != nil {
+			t.Fatalf("writeLockFrame: %v", err)
+		}
+		mt, _ := readMsgType(&buf)
+		if mt != MsgTypeLockRequest {
+			t.Errorf("msgType = %x", mt)
+		}
+		gotID, gotKey, err := readLockFrame(&buf)
+		if err != nil {
+			t.Fatalf("readLockFrame: %v", err)
+		}
+		if !bytes.Equal(gotID, reqID) {
+			t.Errorf("reqID mismatch")
+		}
+		if gotKey != "my-lock" {
+			t.Errorf("key = %q", gotKey)
 		}
 	})
 }
@@ -135,7 +222,6 @@ func TestPeerManagement(t *testing.T) {
 	addr1 := &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 5000}
 	addr2 := &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 5000}
 
-	// Add peers
 	if !p.add(addr1, nil) {
 		t.Error("expected first add to return isNew=true")
 	}
@@ -146,24 +232,20 @@ func TestPeerManagement(t *testing.T) {
 		t.Error("expected add of different peer to return isNew=true")
 	}
 
-	// Count
 	if p.count() != 2 {
 		t.Errorf("expected 2 peers, got %d", p.count())
 	}
 
-	// List
 	addrs := p.list()
 	if len(addrs) != 2 {
 		t.Errorf("expected 2 addresses, got %d", len(addrs))
 	}
 
-	// Get
 	peer, exists := p.get(addr1)
 	if !exists || peer == nil {
 		t.Error("expected to find peer")
 	}
 
-	// Remove
 	existed, _ := p.remove(addr1)
 	if !existed {
 		t.Error("expected remove to return existed=true")
@@ -179,7 +261,6 @@ func TestPeerManagement(t *testing.T) {
 }
 
 // startTestPair creates and starts two connected Alan instances for testing.
-// It returns both instances and a cleanup function.
 func startTestPair(t *testing.T, port1, port2 int) (*Alan, *Alan, context.CancelFunc) {
 	t.Helper()
 
@@ -223,11 +304,9 @@ func connectPeers(t *testing.T, a1, a2 *Alan) {
 		t.Fatalf("failed to dial from a2 to a1: %v", err)
 	}
 
-	// Register in a2's peer list
 	a2.peers.add(a1Addr, conn)
+	go a2.handleConnection(conn, a1Addr)
 
-	// a1 will pick up the connection via its accept loop
-	// Wait a bit for the accept loop to register the peer
 	time.Sleep(100 * time.Millisecond)
 }
 
@@ -242,17 +321,14 @@ func TestStartStop(t *testing.T) {
 	go a.Start(ctx)
 	<-a.Ready()
 
-	// Verify it's running
 	if a.LocalAddr() == nil {
 		t.Error("expected non-nil LocalAddr")
 	}
 
-	// Stop
 	if err := a.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
-	// Double stop should be fine
 	if err := a.Stop(); err != nil {
 		t.Fatalf("Double Stop failed: %v", err)
 	}
@@ -277,18 +353,15 @@ func TestSendTo(t *testing.T) {
 		msgWg.Done()
 	})
 	go a1.Start(ctx)
-
 	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
 
-	// Connect a2 -> a1
 	connectPeers(t, a1, a2)
 
-	// SendTo specific address
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
-	_, err := a2.SendTo(targetAddr, "", []byte("Direct message"))
+	_, err := a2.SendTo(ctx, targetAddr, "", []byte("Direct message"))
 	if err != nil {
 		t.Fatalf("SendTo failed: %v", err)
 	}
@@ -319,17 +392,14 @@ func TestSend(t *testing.T) {
 		msgWg.Done()
 	})
 	go a1.Start(ctx)
-
 	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
 
-	// Connect a2 -> a1
 	connectPeers(t, a1, a2)
 
-	// Broadcast (only a1 is peer)
-	results := a2.Send("", []byte("Broadcast message"))
+	results := a2.Send(ctx, "", []byte("Broadcast message"))
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -354,22 +424,18 @@ func TestSendToAndWaitReply(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// a1 echoes requests with a prefix
 	a1.Handle("", func(ctx context.Context, msg Message) {
 		if msg.IsRequest() {
-			a1.Reply(msg, append([]byte("reply:"), msg.Data...))
+			a1.Reply(ctx, msg, append([]byte("reply:"), msg.Data...))
 		}
 	})
 	go a1.Start(ctx)
-
 	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
 
-	// Connect both ways so a1 can reply to a2
 	connectPeers(t, a1, a2)
-	// Also connect a1 -> a2 so a1 can send reply stream back
 	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port2}
 	dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer dialCancel()
@@ -406,20 +472,17 @@ func TestSendAndWaitReply(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// a1 echoes requests
 	a1.Handle("", func(ctx context.Context, msg Message) {
 		if msg.IsRequest() {
-			a1.Reply(msg, append([]byte("echo:"), msg.Data...))
+			a1.Reply(ctx, msg, append([]byte("echo:"), msg.Data...))
 		}
 	})
 	go a1.Start(ctx)
-
 	go a2.Start(ctx)
 
 	<-a1.Ready()
 	<-a2.Ready()
 
-	// Connect both ways
 	connectPeers(t, a1, a2)
 	a2Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port2}
 	dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -483,7 +546,6 @@ func TestPeerJoinLeaveCallbacks(t *testing.T) {
 	go a1.Start(ctx)
 	<-a1.Ready()
 
-	// Create a2 and connect to a1
 	a2, _ := New(Config{
 		BindAddr:          "127.0.0.1",
 		Port:              port2,
@@ -496,16 +558,13 @@ func TestPeerJoinLeaveCallbacks(t *testing.T) {
 
 	connectPeers(t, a1, a2)
 
-	// Wait for join callback
 	joinWg.Wait()
 	if joinedPeer == nil {
 		t.Fatal("expected join callback to be called")
 	}
 
-	// Simulate peer leaving by stopping a2
 	a2.Stop()
 
-	// Wait for leave callback
 	leaveWg.Wait()
 	if leftPeer == nil {
 		t.Fatal("expected leave callback to be called")
@@ -518,7 +577,6 @@ func TestSecurityPSK(t *testing.T) {
 	const port1 = 16013
 	const port2 = 16014
 
-	// Both peers with same key
 	a1, _ := New(Config{
 		BindAddr: "127.0.0.1",
 		Port:     port1,
@@ -550,7 +608,7 @@ func TestSecurityPSK(t *testing.T) {
 	connectPeers(t, a1, a2)
 
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
-	_, err := a2.SendTo(targetAddr, "", []byte("secure msg"))
+	_, err := a2.SendTo(ctx, targetAddr, "", []byte("secure msg"))
 	if err != nil {
 		t.Fatalf("SendTo failed: %v", err)
 	}
@@ -588,7 +646,6 @@ func TestSecurityPSK_Mismatch(t *testing.T) {
 	<-a1.Ready()
 	<-a2.Ready()
 
-	// Try to dial — should fail because PSK mismatch
 	a1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
 	dialCtx, dialCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer dialCancel()
@@ -614,7 +671,6 @@ func TestLockUnlock(t *testing.T) {
 	<-a.Ready()
 	defer a.Stop()
 
-	// Lock with no peers should succeed immediately
 	lockCtx, lockCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer lockCancel()
 
@@ -622,24 +678,20 @@ func TestLockUnlock(t *testing.T) {
 		t.Fatalf("Lock failed: %v", err)
 	}
 
-	// TryLock should succeed (we already hold it)
-	if !a.TryLock("test-lock") {
+	if !a.TryLock(ctx, "test-lock") {
 		t.Error("TryLock should succeed when we hold the lock")
 	}
 
-	// Unlock
-	if err := a.Unlock("test-lock"); err != nil {
+	if err := a.Unlock(ctx, "test-lock"); err != nil {
 		t.Fatalf("Unlock failed: %v", err)
 	}
 
-	// Unlock again should fail
-	if err := a.Unlock("test-lock"); !errors.Is(err, ErrLockNotHeld) {
+	if err := a.Unlock(ctx, "test-lock"); !errors.Is(err, ErrLockNotHeld) {
 		t.Errorf("expected ErrLockNotHeld, got %v", err)
 	}
 }
 
 func TestQuorumHelpers(t *testing.T) {
-	// No replicas configured
 	a, _ := New(Config{Port: 5000})
 	if a.QuorumSize() != 0 {
 		t.Errorf("expected quorum size 0, got %d", a.QuorumSize())
@@ -648,7 +700,6 @@ func TestQuorumHelpers(t *testing.T) {
 		t.Error("expected HasQuorum()=true when Replicas=0")
 	}
 
-	// With replicas (3-node cluster: quorum = 3/2 = 1 peer needed)
 	a, _ = New(Config{Port: 5000, Replicas: 3})
 	if a.QuorumSize() != 1 {
 		t.Errorf("expected quorum size 1, got %d", a.QuorumSize())
@@ -661,15 +712,13 @@ func TestQuorumHelpers(t *testing.T) {
 func TestSendNotStarted(t *testing.T) {
 	a, _ := New(Config{Port: 5000})
 
-	// Send before Start should return nil
-	results := a.Send("", []byte("test"))
+	results := a.Send(context.Background(), "", []byte("test"))
 	if results != nil {
 		t.Error("expected nil results before start")
 	}
 
-	// SendTo before Start should return error
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5000}
-	_, err := a.SendTo(addr, "", []byte("test"))
+	_, err := a.SendTo(context.Background(), addr, "", []byte("test"))
 	if !errors.Is(err, ErrNotStarted) {
 		t.Errorf("expected ErrNotStarted, got %v", err)
 	}
@@ -679,13 +728,30 @@ func TestLargeData(t *testing.T) {
 	const port1 = 16019
 	const port2 = 16020
 
-	a1, a2, cleanup := startTestPair(t, port1, port2)
-	defer cleanup()
+	// Bump cap so 1 MiB fits.
+	a1, err := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port1,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new a1: %v", err)
+	}
+	a2, err := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port2,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new a2: %v", err)
+	}
+	defer a1.Stop()
+	defer a2.Stop()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
-	// Send 1MB of data
 	largeData := make([]byte, 1024*1024)
 	for i := range largeData {
 		largeData[i] = byte(i % 256)
@@ -700,7 +766,6 @@ func TestLargeData(t *testing.T) {
 		msgWg.Done()
 	})
 	go a1.Start(ctx)
-
 	go a2.Start(ctx)
 
 	<-a1.Ready()
@@ -709,7 +774,7 @@ func TestLargeData(t *testing.T) {
 	connectPeers(t, a1, a2)
 
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
-	_, err := a2.SendTo(targetAddr, "", largeData)
+	_, err = a2.SendTo(ctx, targetAddr, "", largeData)
 	if err != nil {
 		t.Fatalf("SendTo failed: %v", err)
 	}
@@ -733,7 +798,6 @@ func TestWaitForQuorum(t *testing.T) {
 	<-a.Ready()
 	defer a.Stop()
 
-	// Quorum should timeout since we have no peers
 	quorumCtx, quorumCancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer quorumCancel()
 
@@ -766,7 +830,6 @@ func TestMultipleSends(t *testing.T) {
 		msgWg.Done()
 	})
 	go a1.Start(ctx)
-
 	go a2.Start(ctx)
 
 	<-a1.Ready()
@@ -776,7 +839,7 @@ func TestMultipleSends(t *testing.T) {
 
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
 	for i := 0; i < numMessages; i++ {
-		_, err := a2.SendTo(targetAddr, "", []byte("msg"))
+		_, err := a2.SendTo(ctx, targetAddr, "", []byte("msg"))
 		if err != nil {
 			t.Fatalf("SendTo %d failed: %v", i, err)
 		}
@@ -789,4 +852,302 @@ func TestMultipleSends(t *testing.T) {
 		t.Errorf("expected %d messages, got %d", numMessages, len(received))
 	}
 	mu.Unlock()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// New robustness tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestSendBytesOversizeRejected(t *testing.T) {
+	const port1 = 16201
+	const port2 = 16202
+
+	a1, err := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port1,
+		MaxMessageSize:    1024, // 1 KiB
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new a1: %v", err)
+	}
+	a2, err := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port2,
+		MaxMessageSize:    1024,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new a2: %v", err)
+	}
+	defer a1.Stop()
+	defer a2.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go a1.Start(ctx)
+	go a2.Start(ctx)
+	<-a1.Ready()
+	<-a2.Ready()
+
+	connectPeers(t, a1, a2)
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
+	big := make([]byte, 2048) // 2 KiB > 1 KiB cap
+	_, err = a2.SendTo(ctx, targetAddr, "", big)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("expected ErrMessageTooLarge, got %v", err)
+	}
+
+	// Same for Send broadcast: each peer result should carry the error.
+	results := a2.Send(ctx, "", big)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !errors.Is(results[0].Error, ErrMessageTooLarge) {
+		t.Errorf("expected ErrMessageTooLarge in result, got %v", results[0].Error)
+	}
+
+	// Reply oversize.
+	_, err = a2.Reply(ctx, Message{requestID: make([]byte, RequestIDSize), Addr: targetAddr}, big)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Errorf("Reply: expected ErrMessageTooLarge, got %v", err)
+	}
+}
+
+func TestStreamHandlerRoundTrip(t *testing.T) {
+	const port1 = 16203
+	const port2 = 16204
+
+	a1, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port1,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	a2, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port2,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	defer a1.Stop()
+	defer a2.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const payloadSize = 4 * 1024 * 1024 // 4 MiB
+	want := sha256.Sum256(repeatedBytes(payloadSize))
+
+	var got [32]byte
+	var rxSize int64
+	var rxWg sync.WaitGroup
+	rxWg.Add(1)
+
+	a1.HandleStream("blob", func(ctx context.Context, msg Message, body io.Reader) error {
+		defer rxWg.Done()
+		h := sha256.New()
+		n, err := io.Copy(h, body)
+		if err != nil {
+			return err
+		}
+		atomic.StoreInt64(&rxSize, n)
+		copy(got[:], h.Sum(nil))
+		return nil
+	})
+
+	go a1.Start(ctx)
+	go a2.Start(ctx)
+	<-a1.Ready()
+	<-a2.Ready()
+
+	connectPeers(t, a1, a2)
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
+	src := bytes.NewReader(repeatedBytes(payloadSize))
+	n, err := a2.SendToStream(ctx, targetAddr, "blob", src)
+	if err != nil {
+		t.Fatalf("SendToStream: %v", err)
+	}
+	if n != int64(payloadSize) {
+		t.Errorf("sent %d bytes, want %d", n, payloadSize)
+	}
+
+	rxWg.Wait()
+
+	if atomic.LoadInt64(&rxSize) != int64(payloadSize) {
+		t.Errorf("received %d bytes, want %d", rxSize, payloadSize)
+	}
+	if got != want {
+		t.Errorf("hash mismatch: got %x, want %x", got, want)
+	}
+}
+
+func TestSendCtxCancelOnIdlePeer(t *testing.T) {
+	// Verify SendTo respects ctx deadline when the peer connection is alive
+	// but unwilling to accept (we simulate by cancelling immediately).
+	const port1 = 16205
+	const port2 = 16206
+
+	a1, a2, cleanup := startTestPair(t, port1, port2)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go a1.Start(ctx)
+	go a2.Start(ctx)
+	<-a1.Ready()
+	<-a2.Ready()
+
+	connectPeers(t, a1, a2)
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
+
+	cancelledCtx, cancelImmediate := context.WithCancel(ctx)
+	cancelImmediate()
+
+	start := time.Now()
+	_, err := a2.SendTo(cancelledCtx, targetAddr, "", []byte("nope"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("expected error from cancelled ctx")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("expected fast return, took %v", elapsed)
+	}
+}
+
+func TestDuplicateHandlerRejected(t *testing.T) {
+	a, _ := New(Config{Port: 5000})
+
+	if err := a.Handle("foo", func(ctx context.Context, msg Message) {}); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if err := a.HandleStream("foo", func(ctx context.Context, msg Message, body io.Reader) error { return nil }); !errors.Is(err, ErrDuplicateHandler) {
+		t.Errorf("expected ErrDuplicateHandler, got %v", err)
+	}
+
+	a.Remove("foo")
+	if err := a.HandleStream("foo", func(ctx context.Context, msg Message, body io.Reader) error { return nil }); err != nil {
+		t.Fatalf("HandleStream after Remove: %v", err)
+	}
+	if err := a.Handle("foo", func(ctx context.Context, msg Message) {}); !errors.Is(err, ErrDuplicateHandler) {
+		t.Errorf("expected ErrDuplicateHandler, got %v", err)
+	}
+}
+
+func TestPerPeerByteBudgetBackpressure(t *testing.T) {
+	// Configure a tight byte budget and a slow handler. enqueueMessage should
+	// block (applying backpressure) until the handler drains.
+	const port1 = 16207
+	const port2 = 16208
+
+	const budget = 8 * 1024
+	a1, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port1,
+		MessageQueueBytes: budget,
+		MessageQueueSize:  16,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	a2, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port2,
+		HeartbeatInterval: 1 * time.Second,
+		HeartbeatTimeout:  5 * time.Second,
+	})
+	defer a1.Stop()
+	defer a2.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const handlerDelay = 50 * time.Millisecond
+	var processed int32
+
+	a1.Handle("", func(ctx context.Context, msg Message) {
+		time.Sleep(handlerDelay)
+		atomic.AddInt32(&processed, 1)
+	})
+
+	go a1.Start(ctx)
+	go a2.Start(ctx)
+	<-a1.Ready()
+	<-a2.Ready()
+
+	connectPeers(t, a1, a2)
+
+	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port1}
+
+	// Send 8 messages of 4 KiB each = 32 KiB. With an 8 KiB budget and
+	// handlerDelay of 50ms, total wall time should be at least ~150ms
+	// (4 batches of 2 messages drained sequentially).
+	const each = 4 * 1024
+	const count = 8
+	payload := make([]byte, each)
+
+	start := time.Now()
+	for i := 0; i < count; i++ {
+		if _, err := a2.SendTo(ctx, targetAddr, "", payload); err != nil {
+			t.Fatalf("SendTo %d: %v", i, err)
+		}
+	}
+
+	// Wait for all to be processed.
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&processed) < count && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	elapsed := time.Since(start)
+
+	if atomic.LoadInt32(&processed) != count {
+		t.Fatalf("processed %d/%d", atomic.LoadInt32(&processed), count)
+	}
+	// Expect at least handlerDelay * (count / (budget/each)) = 50ms * 4 = 200ms
+	// (with some slack for setup).
+	minElapsed := 100 * time.Millisecond
+	if elapsed < minElapsed {
+		t.Errorf("backpressure not applied: only %v elapsed, expected ≥ %v", elapsed, minElapsed)
+	}
+}
+
+// repeatedBytes returns a slice of n bytes with a deterministic pattern.
+func repeatedBytes(n int) []byte {
+	buf := make([]byte, n)
+	for i := range buf {
+		buf[i] = byte(i % 251)
+	}
+	return buf
+}
+
+// Verify Replicas+QuorumSize math matches doc table.
+func TestQuorumSizeTable(t *testing.T) {
+	cases := []struct {
+		replicas int
+		want     int
+	}{
+		{0, 0},
+		{1, 0},
+		{2, 1},
+		{3, 1},
+		{4, 2},
+		{5, 2},
+		{6, 3},
+		{7, 3},
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("replicas=%d", c.replicas), func(t *testing.T) {
+			a, _ := New(Config{Replicas: c.replicas})
+			if got := a.QuorumSize(); got != c.want {
+				t.Errorf("QuorumSize() = %d, want %d", got, c.want)
+			}
+		})
+	}
 }

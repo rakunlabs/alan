@@ -42,7 +42,7 @@ func TestRunAsLeader_HappyPath(t *testing.T) {
 	if err := a.Lock(lockCtx, "job"); err != nil {
 		t.Fatalf("could not reacquire lock after RunAsLeader returned: %v", err)
 	}
-	_ = a.Unlock("job")
+	_ = a.Unlock(ctx, "job")
 }
 
 // TestRunAsLeader_FnError: fn's error is returned and the lock is still released.
@@ -70,7 +70,7 @@ func TestRunAsLeader_FnError(t *testing.T) {
 	if err := a.Lock(lockCtx, "job"); err != nil {
 		t.Fatalf("lock not released after fn error: %v", err)
 	}
-	_ = a.Unlock("job")
+	_ = a.Unlock(ctx, "job")
 }
 
 // TestRunAsLeader_CtxCancelBeforeAcquire: quorum never met -> Lock blocks on ctx.
@@ -139,7 +139,7 @@ func TestRunAsLeader_CtxCancelDuringFn(t *testing.T) {
 	if err := a.Lock(lockCtx, "job"); err != nil {
 		t.Fatalf("lock not released after ctx cancel: %v", err)
 	}
-	_ = a.Unlock("job")
+	_ = a.Unlock(ctx, "job")
 }
 
 // TestLeaderLoop_RestartsFn: fn exits quickly; loop re-runs it.

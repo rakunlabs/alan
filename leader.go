@@ -33,7 +33,13 @@ func (a *Alan) RunAsLeader(ctx context.Context, key string,
 	if err := a.Lock(ctx, key); err != nil {
 		return err
 	}
-	defer func() { _ = a.Unlock(key) }()
+	defer func() {
+		// Use a fresh short-lived context for Unlock so a cancelled ctx
+		// (the typical reason fn returned) doesn't abort the release broadcast.
+		releaseCtx, cancel := context.WithTimeout(context.Background(), a.config.Timeout)
+		defer cancel()
+		_ = a.Unlock(releaseCtx, key)
+	}()
 	return fn(ctx)
 }
 

@@ -108,7 +108,7 @@ func AlanHandler(ctx context.Context, msg alan.Message) {
 	if msg.IsRequest() {
 		if bytes.Equal(msg.Data, []byte("REQ-ID")) {
 			// Respond with our ID
-			al.Reply(msg, []byte(id))
+			al.Reply(ctx, msg, []byte(id))
 		}
 	}
 }

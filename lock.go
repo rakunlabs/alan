@@ -11,7 +11,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// Lock acquires a named distributed lock, blocking until acquired or context cancelled.
+// Lock acquires a named distributed lock, blocking until acquired or ctx is cancelled.
 func (a *Alan) Lock(ctx context.Context, key string) error {
 	if err := a.waitForQuorum(ctx); err != nil {
 		return err
@@ -42,21 +42,26 @@ func (a *Alan) Lock(ctx context.Context, key string) error {
 	}
 }
 
-// TryLock attempts to acquire a named distributed lock without blocking.
-func (a *Alan) TryLock(key string) bool {
+// TryLock attempts to acquire a named distributed lock without blocking on
+// other holders. ctx caps how long peer-discovery / broadcast may take.
+func (a *Alan) TryLock(ctx context.Context, key string) bool {
 	if !a.HasQuorum() {
 		return false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.config.Timeout)
-	defer cancel()
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), a.config.Timeout)
+		defer cancel()
+	}
 
 	acquired, _ := a.tryAcquireLock(ctx, key)
 	return acquired
 }
 
-// Unlock releases a named distributed lock.
-func (a *Alan) Unlock(key string) error {
+// Unlock releases a named distributed lock and broadcasts the release. ctx caps
+// how long the broadcast may take.
+func (a *Alan) Unlock(ctx context.Context, key string) error {
 	a.locksMu.Lock()
 	state, exists := a.locks[key]
 	if !exists || state.holder != nil {
@@ -75,12 +80,15 @@ func (a *Alan) Unlock(key string) error {
 		}
 	}
 
-	a.broadcastLockRelease(key)
-
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.broadcastLockRelease(ctx, key)
 	return nil
 }
 
-// tryAcquireLock attempts to acquire a lock.
+// tryAcquireLock attempts to acquire a lock and returns either acquired=true,
+// or a waitCh on which the caller can block until the current holder releases.
 func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struct{}) {
 	a.locksMu.Lock()
 
@@ -116,7 +124,6 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 		return true, nil
 	}
 
-	// Generate request ID
 	requestID := make([]byte, RequestIDSize)
 	if _, err := rand.Read(requestID); err != nil {
 		return false, nil
@@ -130,15 +137,13 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 	a.pendingLocksMu.Lock()
 	a.pendingLocks[reqKey] = pending
 	a.pendingLocksMu.Unlock()
-
 	defer func() {
 		a.pendingLocksMu.Lock()
 		delete(a.pendingLocks, reqKey)
 		a.pendingLocksMu.Unlock()
 	}()
 
-	// Broadcast lock request over QUIC streams
-	a.broadcastLockRequest(requestID, key)
+	a.broadcastLockRequest(ctx, requestID, key)
 
 	grants := 0
 	needed := len(peerConns)
@@ -170,20 +175,16 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 	}
 	a.locks[key] = &lockState{holder: nil, waiters: nil}
 	a.locksMu.Unlock()
-
 	return true, nil
 }
 
-// removeWaiter removes a wait channel from a lock's waiters list
 func (a *Alan) removeWaiter(key string, waitCh chan struct{}) {
 	a.locksMu.Lock()
 	defer a.locksMu.Unlock()
-
 	state, exists := a.locks[key]
 	if !exists {
 		return
 	}
-
 	for i, ch := range state.waiters {
 		if ch == waitCh {
 			state.waiters = append(state.waiters[:i], state.waiters[i+1:]...)
@@ -192,67 +193,49 @@ func (a *Alan) removeWaiter(key string, waitCh chan struct{}) {
 	}
 }
 
-// broadcastLockRequest sends a lock request to all peers via QUIC streams.
-func (a *Alan) broadcastLockRequest(requestID []byte, key string) {
-	payload := encodeLockPayload(requestID, key)
-
+func (a *Alan) broadcastLockRequest(ctx context.Context, requestID []byte, key string) {
 	peerConns := a.peers.connAddrs()
 	var wg sync.WaitGroup
 	for _, pc := range peerConns {
 		wg.Add(1)
-		go func(pc struct {
-			Addr *net.UDPAddr
-			Conn *quic.Conn
-		}) {
+		go func(addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			a.sendOnStream(pc.Conn, MsgTypeLockRequest, payload)
-		}(pc)
+			_ = a.sendLockMsg(ctx, conn, MsgTypeLockRequest, requestID, key)
+		}(pc.Addr, pc.Conn)
 	}
 	wg.Wait()
 }
 
-// broadcastLockRelease sends a lock release notification to all peers via QUIC streams.
-func (a *Alan) broadcastLockRelease(key string) {
+func (a *Alan) broadcastLockRelease(ctx context.Context, key string) {
 	requestID := make([]byte, RequestIDSize)
-	payload := encodeLockPayload(requestID, key)
-
 	peerConns := a.peers.connAddrs()
 	var wg sync.WaitGroup
 	for _, pc := range peerConns {
 		wg.Add(1)
-		go func(pc struct {
-			Addr *net.UDPAddr
-			Conn *quic.Conn
-		}) {
+		go func(addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			a.sendOnStream(pc.Conn, MsgTypeLockRelease, payload)
-		}(pc)
+			_ = a.sendLockMsg(ctx, conn, MsgTypeLockRelease, requestID, key)
+		}(pc.Addr, pc.Conn)
 	}
 	wg.Wait()
 }
 
-// sendLockResponse sends a lock grant or deny response to a peer via QUIC stream.
-func (a *Alan) sendLockResponse(msgType byte, requestID []byte, key string, addr *net.UDPAddr) {
+func (a *Alan) sendLockResponse(ctx context.Context, msgType byte, requestID []byte, key string, addr *net.UDPAddr) {
 	conn, ok := a.peers.getConn(addr)
 	if !ok {
 		return
 	}
-
-	payload := encodeLockPayload(requestID, key)
-	a.sendOnStream(conn, msgType, payload)
+	_ = a.sendLockMsg(ctx, conn, msgType, requestID, key)
 }
 
-// releaseLocksHeldBy releases all locks held by a specific peer (called on peer leave)
 func (a *Alan) releaseLocksHeldBy(addr *net.UDPAddr) {
 	a.locksMu.Lock()
 	defer a.locksMu.Unlock()
-
 	peerKey := addr.String()
 	for key, state := range a.locks {
 		if state.holder != nil && state.holder.String() == peerKey {
 			waiters := state.waiters
 			delete(a.locks, key)
-
 			for _, ch := range waiters {
 				select {
 				case ch <- struct{}{}:
@@ -263,34 +246,31 @@ func (a *Alan) releaseLocksHeldBy(addr *net.UDPAddr) {
 	}
 }
 
-// handleLockRequest processes an incoming lock request
 func (a *Alan) handleLockRequest(requestID []byte, key string, sourceAddr *net.UDPAddr) {
 	a.locksMu.Lock()
 	defer a.locksMu.Unlock()
 
+	ctx, cancel := context.WithTimeout(context.Background(), a.config.Timeout)
+	defer cancel()
+
 	state, exists := a.locks[key]
 	if !exists {
 		a.locks[key] = &lockState{holder: sourceAddr, waiters: nil}
-		a.sendLockResponse(MsgTypeLockGrant, requestID, key, sourceAddr)
+		a.sendLockResponse(ctx, MsgTypeLockGrant, requestID, key, sourceAddr)
 		return
 	}
-
 	if state.holder == nil {
-		a.sendLockResponse(MsgTypeLockDeny, requestID, key, sourceAddr)
+		a.sendLockResponse(ctx, MsgTypeLockDeny, requestID, key, sourceAddr)
 		return
 	}
-
-	a.sendLockResponse(MsgTypeLockDeny, requestID, key, sourceAddr)
+	a.sendLockResponse(ctx, MsgTypeLockDeny, requestID, key, sourceAddr)
 }
 
-// handleLockGrant processes an incoming lock grant response
 func (a *Alan) handleLockGrant(requestID []byte, _ string, sourceAddr *net.UDPAddr) {
 	reqKey := hex.EncodeToString(requestID)
-
 	a.pendingLocksMu.Lock()
 	pending, ok := a.pendingLocks[reqKey]
 	a.pendingLocksMu.Unlock()
-
 	if ok {
 		select {
 		case pending.grantCh <- sourceAddr:
@@ -299,10 +279,8 @@ func (a *Alan) handleLockGrant(requestID []byte, _ string, sourceAddr *net.UDPAd
 	}
 }
 
-// handleLockDeny processes an incoming lock deny response
 func (a *Alan) handleLockDeny(requestID []byte, key string, sourceAddr *net.UDPAddr) {
 	reqKey := hex.EncodeToString(requestID)
-
 	a.locksMu.Lock()
 	state, exists := a.locks[key]
 	if !exists {
@@ -316,7 +294,6 @@ func (a *Alan) handleLockDeny(requestID []byte, key string, sourceAddr *net.UDPA
 	a.pendingLocksMu.Lock()
 	pending, ok := a.pendingLocks[reqKey]
 	a.pendingLocksMu.Unlock()
-
 	if ok {
 		select {
 		case pending.denyCh <- sourceAddr:
@@ -325,7 +302,6 @@ func (a *Alan) handleLockDeny(requestID []byte, key string, sourceAddr *net.UDPA
 	}
 }
 
-// handleLockRelease processes an incoming lock release notification
 func (a *Alan) handleLockRelease(key string, sourceAddr *net.UDPAddr) {
 	a.locksMu.Lock()
 	state, exists := a.locks[key]
@@ -333,12 +309,10 @@ func (a *Alan) handleLockRelease(key string, sourceAddr *net.UDPAddr) {
 		a.locksMu.Unlock()
 		return
 	}
-
 	if state.holder != nil && state.holder.String() == sourceAddr.String() {
 		waiters := state.waiters
 		delete(a.locks, key)
 		a.locksMu.Unlock()
-
 		for _, ch := range waiters {
 			select {
 			case ch <- struct{}{}:
@@ -347,6 +321,5 @@ func (a *Alan) handleLockRelease(key string, sourceAddr *net.UDPAddr) {
 		}
 		return
 	}
-
 	a.locksMu.Unlock()
 }

@@ -5,12 +5,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-	"io"
 	"math/big"
 	"time"
 
@@ -18,45 +18,45 @@ import (
 )
 
 const (
-	// alpnProtocol is the ALPN protocol identifier for alan peers.
-	alpnProtocol = "alan/1"
-	// pskPrefix is used to derive a PSK verifier from the shared key.
+	// alpnProtocol is the ALPN protocol identifier negotiated during the
+	// QUIC/TLS handshake. Bumping this is the supported way to make a
+	// breaking wire-format change: peers running a different ALPN simply
+	// fail the handshake and never become members.
+	alpnProtocol = "alan/2"
+	// pskPrefix is mixed into the PSK hash so the same Key cannot be reused
+	// to authenticate against any other system that hashes the same secret.
 	pskPrefix = "github.com/rakunlabs/alan/psk"
 )
 
-// derivePSKHash derives a 32-byte hash from the shared key for PSK verification via ALPN trick.
+// derivePSKHash derives a 32-byte fingerprint of sharedKey, used to bind a
+// peer's TLS certificate to cluster membership.
 func derivePSKHash(sharedKey []byte) [32]byte {
 	return sha256.Sum256(append([]byte(pskPrefix), sharedKey...))
 }
 
+// pskHashHex returns the lowercase-hex encoding of the PSK fingerprint that
+// gets embedded in TLS certificates and compared during VerifyPeerCertificate.
+func pskHashHex(sharedKey []byte) string {
+	h := derivePSKHash(sharedKey)
+	return hex.EncodeToString(h[:])
+}
+
 // newServerTLSConfig creates a TLS config for the QUIC listener.
-// If sharedKey is non-nil, VerifyPeerCertificate is set to validate the PSK.
+// If sharedKey is non-nil, VerifyPeerCertificate enforces PSK admission.
 func newServerTLSConfig(cert tls.Certificate, sharedKey []byte) *tls.Config {
 	cfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{alpnProtocol},
 		ClientAuth:   tls.RequireAnyClientCert,
-		// We don't verify the actual certificate chain — peers use ephemeral self-signed certs.
-		// Security comes from the pre-shared key embedded in the cert's Subject (if enabled).
+		// Chain validation is intentionally disabled: peers use ephemeral
+		// self-signed certificates. Trust is established by VerifyPeerCertificate
+		// below (when a shared key is configured).
 		InsecureSkipVerify: true,
 	}
 
 	if len(sharedKey) > 0 {
-		pskHash := derivePSKHash(sharedKey)
-		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("no client certificate")
-			}
-			cert, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return fmt.Errorf("parse cert: %w", err)
-			}
-			// Check that the peer's cert has the expected Organization field (PSK proof)
-			if len(cert.Subject.Organization) == 0 || cert.Subject.Organization[0] != fmt.Sprintf("%x", pskHash) {
-				return fmt.Errorf("PSK mismatch: peer not in cluster")
-			}
-			return nil
-		}
+		expected := pskHashHex(sharedKey)
+		cfg.VerifyPeerCertificate = makePSKVerifier(expected, "client")
 	}
 
 	return cfg
@@ -71,26 +71,39 @@ func newClientTLSConfig(cert tls.Certificate, sharedKey []byte) *tls.Config {
 	}
 
 	if len(sharedKey) > 0 {
-		pskHash := derivePSKHash(sharedKey)
-		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("no server certificate")
-			}
-			cert, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return fmt.Errorf("parse cert: %w", err)
-			}
-			if len(cert.Subject.Organization) == 0 || cert.Subject.Organization[0] != fmt.Sprintf("%x", pskHash) {
-				return fmt.Errorf("PSK mismatch: peer not in cluster")
-			}
-			return nil
-		}
+		expected := pskHashHex(sharedKey)
+		cfg.VerifyPeerCertificate = makePSKVerifier(expected, "server")
 	}
 
 	return cfg
 }
 
-// generatePSKCert creates a self-signed cert that embeds the PSK hash in Organization field.
+// makePSKVerifier returns a TLS VerifyPeerCertificate callback that checks the
+// peer cert's Subject.Organization equals the expected PSK fingerprint, using
+// a constant-time comparison.
+func makePSKVerifier(expected, role string) func([][]byte, [][]*x509.Certificate) error {
+	expectedBytes := []byte(expected)
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("no %s certificate", role)
+		}
+		cert, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("parse cert: %w", err)
+		}
+		if len(cert.Subject.Organization) == 0 {
+			return fmt.Errorf("PSK mismatch: peer not in cluster")
+		}
+		got := []byte(cert.Subject.Organization[0])
+		if subtle.ConstantTimeCompare(got, expectedBytes) != 1 {
+			return fmt.Errorf("PSK mismatch: peer not in cluster")
+		}
+		return nil
+	}
+}
+
+// generatePSKCert creates a self-signed certificate that embeds the PSK
+// fingerprint in Subject.Organization. The private key never leaves memory.
 func generatePSKCert(sharedKey []byte) (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -104,8 +117,7 @@ func generatePSKCert(sharedKey []byte) (tls.Certificate, error) {
 
 	subject := pkix.Name{CommonName: "alan-peer"}
 	if len(sharedKey) > 0 {
-		pskHash := derivePSKHash(sharedKey)
-		subject.Organization = []string{fmt.Sprintf("%x", pskHash)}
+		subject.Organization = []string{pskHashHex(sharedKey)}
 	}
 
 	tmpl := &x509.Certificate{
@@ -128,55 +140,23 @@ func generatePSKCert(sharedKey []byte) (tls.Certificate, error) {
 	}, nil
 }
 
-// newQUICConfig creates the QUIC config for connections.
-func newQUICConfig(keepAlive time.Duration, maxIdle time.Duration) *quic.Config {
+// newQUICConfig builds the QUIC config for both server and client roles.
+// Stream/connection windows scale with maxMessageSize so flow control is
+// large enough not to throttle typical messages, but never below 64 MiB so
+// streaming workloads have headroom.
+func newQUICConfig(keepAlive, maxIdle time.Duration, maxMessageSize int64) *quic.Config {
+	const minWindow = uint64(64 * 1024 * 1024) // 64 MiB
+	streamWindow := minWindow
+	if maxMessageSize > 0 && uint64(maxMessageSize) > streamWindow {
+		streamWindow = uint64(maxMessageSize)
+	}
+	connWindow := streamWindow * 2
+
 	return &quic.Config{
-		MaxIdleTimeout:  maxIdle,
-		KeepAlivePeriod: keepAlive,
-		// Allow many concurrent streams for parallel sends
-		MaxIncomingStreams: 1024,
-		// Large receive windows for big data transfers
-		MaxStreamReceiveWindow:     64 * 1024 * 1024,  // 64 MB
-		MaxConnectionReceiveWindow: 128 * 1024 * 1024, // 128 MB
+		MaxIdleTimeout:             maxIdle,
+		KeepAlivePeriod:            keepAlive,
+		MaxIncomingStreams:         1024,
+		MaxStreamReceiveWindow:     streamWindow,
+		MaxConnectionReceiveWindow: connWindow,
 	}
-}
-
-// Stream framing: each message on a QUIC stream is:
-//   [MsgType:1][PayloadLen:4 big-endian][Payload:N]
-
-// writeStreamMessage writes a framed message to a QUIC stream.
-func writeStreamMessage(w io.Writer, msgType byte, payload []byte) error {
-	header := make([]byte, 5)
-	header[0] = msgType
-	binary.BigEndian.PutUint32(header[1:5], uint32(len(payload)))
-
-	if _, err := w.Write(header); err != nil {
-		return fmt.Errorf("write header: %w", err)
-	}
-	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
-			return fmt.Errorf("write payload: %w", err)
-		}
-	}
-	return nil
-}
-
-// readStreamMessage reads a framed message from a QUIC stream.
-func readStreamMessage(r io.Reader) (msgType byte, payload []byte, err error) {
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return 0, nil, err
-	}
-
-	msgType = header[0]
-	length := binary.BigEndian.Uint32(header[1:5])
-
-	if length > 0 {
-		payload = make([]byte, length)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return 0, nil, fmt.Errorf("read payload: %w", err)
-		}
-	}
-
-	return msgType, payload, nil
 }

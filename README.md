@@ -6,19 +6,25 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/rakunlabs/alan?style=flat-square)](https://goreportcard.com/report/github.com/rakunlabs/alan)
 [![Go PKG](https://raw.githubusercontent.com/rakunlabs/.github/main/assets/badges/gopkg.svg)](https://pkg.go.dev/github.com/rakunlabs/alan)
 
-QUIC-based peer discovery and communication library for Go. All peer-to-peer traffic is secured by QUIC's built-in TLS 1.3.
+QUIC-based peer discovery and communication library for Go. All peer-to-peer
+traffic is secured by QUIC's built-in TLS 1.3, with optional pre-shared-key
+admission control. Supports both bytes-style RPC and zero-copy streaming for
+arbitrarily large payloads.
 
 ## Features
 
-- **DNS-based peer discovery** - Resolve a DNS name to discover cluster members
-- **Automatic membership** - JOIN/LEAVE/HEARTBEAT protocol for peer tracking
-- **Secure transport by default** - All traffic runs over QUIC with TLS 1.3 (mTLS); optional pre-shared key restricts which peers may join the cluster
-- **Request-Reply pattern** - Send requests and wait for responses from peers
-- **Distributed locking** - Named locks with automatic release on peer disconnect
-- **Quorum support** - Configurable quorum requirement for distributed operations
-- **Simple API** - `Start()`, `Send()`, `Stop()` - that's it
-- **Callbacks** - Get notified when peers join or leave
-- **Auto-refresh** - Optionally re-resolve DNS to discover new peers
+- **DNS-based peer discovery** — resolve a DNS name to discover cluster members
+- **Automatic membership** — JOIN/LEAVE on QUIC connect/disconnect
+- **Secure transport by default** — QUIC + TLS 1.3 (mTLS); optional pre-shared
+  key restricts which peers may join
+- **Byte and streaming I/O** — `Send`/`Handle` for bounded RPC, `SendStream`/
+  `HandleStream` for arbitrary-size payloads
+- **Request-Reply pattern** — fire-and-collect responses across the cluster
+- **Distributed locking** — named locks with automatic release on peer disconnect
+- **Quorum support** — configurable quorum requirement for distributed operations
+- **Cancellation everywhere** — every blocking method takes `context.Context`
+- **Bounded memory by default** — `MaxMessageSize` cap and per-peer byte budget
+  protect receivers from runaway senders
 
 ## Installation
 
@@ -35,117 +41,52 @@ import (
     "context"
     "fmt"
     "net"
+
     "github.com/rakunlabs/alan"
 )
 
 func main() {
-    // Create Alan instance
     a, err := alan.New(alan.Config{
-        DNSAddr: "my-cluster.local",  // DNS name for peer discovery
+        DNSAddr: "my-cluster.local",
         Port:    5000,
     })
     if err != nil {
         panic(err)
     }
 
-    // Optional: Get notified when peers join/leave
     a.OnPeerJoin(func(addr *net.UDPAddr) {
-        fmt.Printf("Peer joined: %s\n", addr)
+        fmt.Printf("peer joined: %s\n", addr)
     })
     a.OnPeerLeave(func(addr *net.UDPAddr) {
-        fmt.Printf("Peer left: %s\n", addr)
+        fmt.Printf("peer left: %s\n", addr)
     })
 
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    // Register message handler
     a.Handle("", func(ctx context.Context, msg alan.Message) {
-        fmt.Printf("Received from %s: %s\n", msg.Addr, msg.Data)
+        fmt.Printf("received from %s: %s\n", msg.Addr, msg.Data)
     })
 
-    // Start in background
-    go func() {
-        a.Start(ctx)
-    }()
+    go a.Start(ctx)
 
-    // Send to all peers
-    a.Send("", []byte("Hello everyone!"))
+    // Broadcast.
+    a.Send(ctx, "", []byte("Hello everyone!"))
 
-    // Send to specific peer
-    a.SendTo(specificAddr, "", []byte("Hello you!"))
+    // Send to a specific peer.
+    target := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 5000}
+    a.SendTo(ctx, target, "", []byte("Hello you!"))
 
-    // Graceful shutdown
     a.Stop()
 }
 ```
 
-## Global Instance
-
-For services that create a single cluster-wide `Alan` instance, you can register
-it as a process-wide default and access it from any package without passing the
-handle around. This follows the same pattern as `slog.Default` / `slog.SetDefault`.
-
-### Register at startup
-
-```go
-func main() {
-    a, err := alan.New(alan.Config{DNSAddr: "my-cluster.local", Port: 5000})
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    a.Handle("", handleMessage)
-    go a.Start(ctx)
-
-    // Register as the process-wide default
-    alan.SetDefault(a)
-
-    // ... run your service ...
-}
-```
-
-### Use from any package
-
-```go
-package worker
-
-import "github.com/rakunlabs/alan"
-
-func Notify(data []byte) error {
-    a, err := alan.Default()
-    if err != nil {
-        return err // no default registered yet
-    }
-    a.Send("", data)
-    return nil
-}
-```
-
-### API
-
-| Function | Description |
-|----------|-------------|
-| `SetDefault(*Alan)` | Register the global instance (pass `nil` to clear) |
-| `Default() (*Alan, error)` | Get the instance; returns `ErrNoDefault` if none set |
-| `MustDefault() *Alan` | Get the instance; panics if none set |
-| `HasDefault() bool` | Check whether a default is registered |
-
-Internally uses `atomic.Pointer[Alan]`, so `Default()` / `MustDefault()` are
-lock-free on the hot path and `SetDefault()` is safe from any goroutine.
-
-> **When not to use this:** if a single process needs to join two clusters
-> (two `Alan` instances), prefer passing `*Alan` as a dependency. The global
-> is a convenience for the common single-cluster case.
-
 ## Cluster Admission (Pre-Shared Key)
 
-Traffic is **always** encrypted by QUIC/TLS 1.3 — there is no insecure mode. To restrict
-*which* peers may join your cluster, configure a pre-shared key. Only peers presenting a
-TLS certificate bound to the same key are accepted during the handshake.
+Traffic is **always** encrypted by QUIC/TLS 1.3 — there is no insecure mode.
+To restrict *which* peers may join your cluster, configure a pre-shared key.
+Only peers presenting a TLS certificate bound to the same key are accepted
+during the handshake.
 
 ```go
 a, err := alan.New(alan.Config{
@@ -158,131 +99,182 @@ a, err := alan.New(alan.Config{
 })
 ```
 
-When `Enabled` is true, the same `Key` must be configured on every peer. Peers with a
-different key (or no key) will fail the TLS handshake and never become members.
+When `Enabled` is true, every peer must use the same `Key`. Peers with a
+different key (or no key) fail the TLS handshake and never become members.
 
-## Request-Reply Pattern
+## Streaming I/O
 
-Alan supports a request-reply pattern for scenarios where you need responses from peers:
+For payloads that exceed `MaxMessageSize` (default 16 MiB), use the streaming
+API. Both sides handle the body as an `io.Reader` / `io.Writer`, so memory
+stays bounded regardless of payload size.
 
-### Send to All Peers and Collect Responses
+### Sender — stream from a file
 
 ```go
-// Broadcast request to all peers and wait for their responses
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+f, _ := os.Open("big.bin")
+defer f.Close()
+
+target := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 5000}
+n, err := a.SendToStream(ctx, target, "blob", f)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("sent %d bytes\n", n)
+```
+
+For broadcast streaming use `SendStream`. The `io.Reader` is consumed once,
+so peers are written serially.
+
+### Receiver — stream to a hash / file / pipeline
+
+```go
+a.HandleStream("blob", func(ctx context.Context, msg alan.Message, body io.Reader) error {
+    h := sha256.New()
+    n, err := io.Copy(h, body)
+    if err != nil {
+        return err
+    }
+    log.Printf("got %d bytes from %s, sha256=%x", n, msg.Addr, h.Sum(nil))
+    return nil
+})
+```
+
+A given message-type can have **either** a byte handler (`Handle`) or a
+stream handler (`HandleStream`), not both. Registering the second one returns
+`ErrDuplicateHandler`.
+
+Stream handlers run on a per-message goroutine; messages from the same peer
+may be processed concurrently. Use `Handle` if you need ordered delivery.
+
+## Global Instance
+
+For services that create a single cluster-wide `Alan` instance, register it
+as a process-wide default and access it from any package without passing the
+handle around. Same pattern as `slog.Default` / `slog.SetDefault`.
+
+```go
+func main() {
+    a, _ := alan.New(alan.Config{DNSAddr: "my-cluster.local", Port: 5000})
+
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    a.Handle("", handleMessage)
+    go a.Start(ctx)
+
+    alan.SetDefault(a)
+    // ... run your service ...
+}
+
+// In some other package:
+func Notify(ctx context.Context, data []byte) error {
+    a, err := alan.Default()
+    if err != nil {
+        return err
+    }
+    a.Send(ctx, "", data)
+    return nil
+}
+```
+
+| Function | Description |
+|----------|-------------|
+| `SetDefault(*Alan)` | Register the global instance (pass `nil` to clear) |
+| `Default() (*Alan, error)` | Get the instance; returns `ErrNoDefault` if none set |
+| `MustDefault() *Alan` | Get the instance; panics if none set |
+| `HasDefault() bool` | Check whether a default is registered |
+
+`Default` / `MustDefault` use `atomic.Pointer[Alan]` and are lock-free on the
+hot path. `SetDefault` is safe from any goroutine.
+
+> If a single process needs to join two clusters, prefer passing `*Alan` as
+> a dependency. The global is a convenience for the common single-cluster case.
+
+## Request-Reply
+
+```go
+// Broadcast a request, collect responses.
+ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 defer cancel()
 
 replies, err := a.SendAndWaitReply(ctx, "", []byte("status-request"))
 if err != nil && !errors.Is(err, context.DeadlineExceeded) {
     log.Fatal(err)
 }
-
 for _, reply := range replies {
-    fmt.Printf("Response from %s: %s\n", reply.Addr, reply.Data)
+    fmt.Printf("from %s: %s\n", reply.Addr, reply.Data)
 }
+
+// Single peer:
+target := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 5000}
+reply, err := a.SendToAndWaitReply(ctx, target, "", []byte("ping"))
 ```
 
-### Send to Specific Peer and Wait for Response
-
-```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-
-reply, err := a.SendToAndWaitReply(ctx, peerAddr, "", []byte("ping"))
-if err != nil {
-    log.Fatal(err)
-}
-fmt.Printf("Got response: %s\n", reply.Data)
-```
-
-### Handling Requests (Responder Side)
+### Responder side
 
 ```go
 a.Handle("", func(ctx context.Context, msg alan.Message) {
     if msg.IsRequest() {
-        // This is a request expecting a reply
-        response := processRequest(msg.Data)
-        a.Reply(msg, response)
+        a.Reply(ctx, msg, processRequest(msg.Data))
     } else {
-        // Regular fire-and-forget message
         handleMessage(msg.Data)
     }
 })
-go a.Start(ctx)
 ```
 
-### Notes on Request-Reply
+Notes:
 
-- **Smart peer tracking**: The library tracks which peers you're waiting for responses from
-- **Early return on disconnect**: If a peer disconnects (gracefully or via heartbeat timeout) while waiting, the library automatically adjusts:
-  - `SendAndWaitReply`: Removes the disconnected peer from expected responses and returns when all remaining peers have responded
-  - `SendToAndWaitReply`: Returns immediately with `ErrPeerDisconnected` if the target peer disconnects
-- **No infinite waits**: Because peer disconnects are detected via the membership protocol, requests won't wait forever for unresponsive peers
-- The request ID correlation is handled automatically by the library
+- The library tracks which peers a request is waiting for. If a peer
+  disconnects while you are waiting:
+  - `SendAndWaitReply` drops it from the expected set and returns when the
+    remaining peers have responded.
+  - `SendToAndWaitReply` returns `ErrPeerDisconnected` immediately.
+- Request/response bodies are bytes-only and capped by `MaxMessageSize`.
+  Use `SendStream` / `HandleStream` for one-way streaming workloads.
+- Request ID correlation is handled by the library.
 
 ## Distributed Locking
 
-Alan provides distributed named locks for coordinating work across peers:
-
-### Basic Lock Usage
-
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 defer cancel()
 
-// Acquire a named lock (blocks until acquired or context cancelled)
-err := a.Lock(ctx, "my-job")
-if err != nil {
-    log.Fatal("failed to acquire lock:", err)
+if err := a.Lock(ctx, "my-job"); err != nil {
+    log.Fatal(err)
 }
-
-// Do protected work...
 doExclusiveWork()
-
-// Release the lock
-err = a.Unlock("my-job")
-if err != nil {
-    log.Fatal("failed to release lock:", err)
+if err := a.Unlock(ctx, "my-job"); err != nil {
+    log.Fatal(err)
 }
 ```
 
-### TryLock (Non-blocking)
+Non-blocking variant:
 
 ```go
-// Try to acquire lock without blocking
-if a.TryLock("my-job") {
-    // Got the lock
-    defer a.Unlock("my-job")
+if a.TryLock(ctx, "my-job") {
+    defer a.Unlock(ctx, "my-job")
     doWork()
-} else {
-    // Lock is held by another peer
-    log.Println("could not acquire lock")
 }
 ```
 
-### Lock Features
+Features:
 
-- **Named locks**: Multiple independent locks identified by key
-- **Auto-release**: Locks are automatically released when the holder disconnects
-- **Quorum-aware**: When quorum is enabled, `Lock()` waits for quorum before acquiring
-- **Context support**: `Lock()` respects context cancellation and deadlines
+- **Named locks** — multiple independent locks identified by key
+- **Auto-release** — held locks are released automatically when the holder disconnects
+- **Quorum-aware** — `Lock` waits for quorum before acquiring
+- **Context-driven** — every lock method respects `ctx`
 
-### Lock Limitations
+Limitations: distributed lock is **best-effort coordination**, not strong
+consistency.
 
-The distributed lock provides **best-effort coordination**, not strong consistency:
-
-- **Split-brain possible**: During network partitions, multiple peers might acquire the same lock
-- **No fencing tokens**: There's no mechanism to prove lock ownership to external systems
-- **Startup race**: If peers start simultaneously before discovering each other, both might acquire a lock
-
-Use quorum configuration to mitigate the startup race condition.
+- During network partitions, multiple peers may believe they hold the lock.
+- No fencing tokens — there's no way to prove ownership to an external system.
+- Startup race: peers starting simultaneously may all acquire the lock before
+  discovering each other. Configure `Replicas` so quorum mitigates this.
 
 ### Leader Election Helpers
 
-For the common pattern "only one instance in the cluster should run this
-long-running task", Alan provides two wrappers around `Lock`/`Unlock`.
-
-#### RunAsLeader
+For "only one instance in the cluster runs this long-running task":
 
 ```go
 err := a.RunAsLeader(ctx, "scheduler", func(ctx context.Context) error {
@@ -290,271 +282,283 @@ err := a.RunAsLeader(ctx, "scheduler", func(ctx context.Context) error {
         return err
     }
     defer scheduler.Stop()
-    <-ctx.Done() // hold leadership until shutdown
-    return ctx.Err()
-})
-```
-
-Blocks inside the acquire until this instance becomes leader, runs `fn`,
-and releases the lock when `fn` returns or `ctx` is cancelled. Other
-instances in the cluster block in their own `RunAsLeader` call until the
-current leader releases (via `Unlock`, `fn` returning, or heartbeat timeout
-if the leader crashes).
-
-This replaces hand-rolled leader loops like:
-
-```go
-// Before: manual retry / hold / release
-for {
-    if err := a.Lock(ctx, "scheduler"); err != nil {
-        if ctx.Err() != nil { return }
-        time.Sleep(5 * time.Second)
-        continue
-    }
-    startWork()
-    <-ctx.Done()
-    stopWork()
-    a.Unlock("scheduler")
-    return
-}
-
-// After:
-a.RunAsLeader(ctx, "scheduler", func(ctx context.Context) error {
-    startWork()
-    defer stopWork()
     <-ctx.Done()
     return ctx.Err()
 })
 ```
 
-#### LeaderLoop
+Other instances block in their own `RunAsLeader` until the current leader
+releases (via `Unlock`, `fn` returning, or QUIC idle timeout if it crashes).
 
-Same as `RunAsLeader` but re-acquires if `fn` exits before `ctx` is cancelled:
+`LeaderLoop` re-acquires if `fn` returns before `ctx` is cancelled:
 
 ```go
 err := a.LeaderLoop(ctx, "scheduler", 5*time.Second,
     func(ctx context.Context) error {
-        return runCron(ctx) // if this returns, helper retries after 5s
+        return runCron(ctx)
     })
 ```
 
-Useful when `fn` might exit unexpectedly but you still want the service to
-retain leader semantics across the cluster. Errors returned by `fn` are
-discarded by the loop — handle them inside `fn` (log, metrics, etc.) if
-you need them. `LeaderLoop` itself returns only when `ctx` is cancelled,
-and always returns `ctx.Err()`. A `retryDelay` of 0 uses a 1-second default.
-
-#### Notes
-
-- Alan locks have no TTL / session; once held, the holder keeps the lock
-  until it calls `Unlock`, exits gracefully (LEAVE), or stops heartbeating
-  (detected via `HeartbeatTimeout`). There is no mid-run "lock lost"
-  notification — these helpers assume holding the lock == being the leader.
+Notes:
+- Locks have no TTL / session: the holder keeps them until `Unlock`, graceful
+  exit, or QUIC `MaxIdleTimeout`. There is no "lock lost" notification.
 - The helpers do not pass a separate "leader context" to `fn`. If you need
-  a context scoped strictly to the leadership window (e.g. to cancel
-  dependent workers when leadership ends), derive one inside `fn`.
+  a context scoped to leadership specifically, derive one inside `fn`.
 
 ## Quorum
 
-Quorum ensures operations only proceed when enough peers are present in the cluster:
-
-### Configuration
+Quorum ensures distributed operations only proceed when enough peers are
+present in the cluster.
 
 ```go
-a, err := alan.New(alan.Config{
-    DNSAddr: "my-cluster.local",
-    Port:    5000,
-    Quorum:  3, // Expected cluster size
+a, _ := alan.New(alan.Config{
+    DNSAddr:  "my-cluster.local",
+    Port:     5000,
+    Replicas: 3, // expected total cluster size, including self
 })
 ```
 
-With `Quorum: 3`, operations require `(3/2)+1 = 2` peers to be present.
+`Replicas` is the **total** cluster size; the quorum is a majority of that
+total. `QuorumSize()` returns the number of *peers* (excluding self) required:
 
-| Quorum Setting | Required Peers |
-|----------------|----------------|
-| 0 (default)    | Disabled       |
-| 1              | 1              |
-| 2              | 2              |
-| 3              | 2              |
-| 4              | 3              |
-| 5              | 3              |
+| Replicas | Required peers (`QuorumSize`) | Effective quorum |
+|---------:|-----------------------------:|-----------------:|
+| 0        | 0                            | disabled         |
+| 1        | 0                            | 1 (just self)    |
+| 2        | 1                            | 2 of 2           |
+| 3        | 1                            | 2 of 3           |
+| 4        | 2                            | 3 of 4           |
+| 5        | 2                            | 3 of 5           |
+| 6        | 3                            | 4 of 6           |
+| 7        | 3                            | 4 of 7           |
 
-### Quorum-Aware Operations
+Operations:
 
-| Operation | Quorum Behavior |
-|-----------|-----------------|
-| `Lock(ctx, key)` | Waits for quorum, then acquires lock |
-| `TryLock(key)` | Returns `false` if quorum not met |
-
-### Checking Quorum Status
-
-```go
-// Check if quorum is currently met
-if a.HasQuorum() {
-    // Safe to proceed
-}
-
-// Get required peer count
-required := a.QuorumSize() // Returns (Quorum/2)+1
-
-// Wait for quorum before starting work
-ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-defer cancel()
-if err := a.WaitForQuorum(ctx); err != nil {
-    log.Fatal("cluster not ready:", err)
-}
-```
+| Operation | Behaviour |
+|-----------|-----------|
+| `Lock(ctx, key)` | Waits for quorum, then acquires |
+| `TryLock(ctx, key)` | Returns false if quorum not met |
+| `HasQuorum()` | Snapshot check |
+| `WaitForQuorum(ctx)` | Block until quorum reached |
+| `HasAllPeers()` / `WaitAll(ctx)` | Same but for full membership |
 
 ## Configuration
 
 ```go
 type Config struct {
-    // DNSAddr is the DNS name to resolve for discovering peers (required)
+    // DNSAddr is the DNS name to resolve for discovering peers (optional).
     DNSAddr string
-    
-    // BindAddr is the local IP address to bind to (default: "0.0.0.0" for all interfaces)
-    // Useful when running multiple instances on same machine with different IPs
+
+    // BindAddr is the local IP to bind to (default: "0.0.0.0").
     BindAddr string
-    
-    // Port is the UDP port to use (default: 5000)
-    // IMPORTANT: All peers in the cluster MUST use the same port
+
+    // Port is the UDP port to use (default: 5000). All peers must use the
+    // same port — DNS only provides IPs, the port is taken from this field.
     Port int
-    
-    // Timeout is the read/write timeout (default: 5s)
+
+    // Timeout is the read/write timeout for short control operations (default: 5s).
     Timeout time.Duration
-    
-    // BufferSize for receiving messages (default: 4096)
-    BufferSize int
-    
-    // HeartbeatInterval - how often to send heartbeats (default: 5s)
+
+    // HeartbeatInterval controls QUIC KeepAlivePeriod (default: 5s).
     HeartbeatInterval time.Duration
-    
-    // HeartbeatTimeout - when a peer is considered dead (default: 15s)
+
+    // HeartbeatTimeout controls QUIC MaxIdleTimeout (default: 15s).
+    // Peers not exchanging traffic within this window are torn down.
     HeartbeatTimeout time.Duration
-    
-    // RefreshInterval - how often to re-resolve DNS (default: 30s, set to -1 to disable)
-    // Note: Refresh only adds new peers; stale peers are removed via heartbeat timeout
+
+    // RefreshInterval is how often to re-resolve DNS (default: 30s; -1 disables).
+    // Refresh only adds new peers; stale peers are removed via QUIC idle timeout.
     RefreshInterval time.Duration
-    
-    // MessageQueueSize - per-peer message buffer size (default: 256)
-    // Messages from the same peer are processed in order.
-    // When the queue is full, the listener blocks until space is available.
+
+    // MessageQueueSize is the per-peer queue length for byte handlers
+    // (default: 256). Stream handlers bypass the queue.
     MessageQueueSize int
-    
-    // Quorum - expected cluster size for distributed operations (default: 0 = disabled)
-    // When set, operations like Lock() and SendCtx() wait until (Quorum/2)+1 peers are present
-    Quorum int
+
+    // MaxMessageSize is the maximum payload size in bytes for the bytes-API
+    // (Send / SendTo / SendAndWaitReply / Reply). Larger payloads are
+    // rejected with ErrMessageTooLarge before allocation. Default: 16 MiB.
+    // Negative disables the cap (not recommended). Use SendStream / HandleStream
+    // for arbitrary-size payloads.
+    MaxMessageSize int64
+
+    // MessageQueueBytes is the per-peer queue's byte budget. When exceeded,
+    // the QUIC accept loop blocks on enqueue (backpressure). Default: 256 MiB.
+    // Negative disables the cap.
+    MessageQueueBytes int64
+
+    // StreamOpenTimeout is the maximum time the receiver will wait for the
+    // first byte of a newly accepted stream before closing it. Defends
+    // against half-open streams. Default: 10s.
+    StreamOpenTimeout time.Duration
+
+    // Replicas is the expected total cluster size (including self) for
+    // quorum-aware operations. 0 disables quorum (default).
+    Replicas int
 
     // Security configures the optional pre-shared key for cluster admission.
-    // Transport encryption (QUIC/TLS 1.3) is always enabled regardless of this field.
+    // Transport encryption (QUIC/TLS 1.3) is always enabled regardless.
     Security SecurityConfig
 }
 
 type SecurityConfig struct {
-    // Key is a pre-shared cluster admission secret. Any length; hashed with SHA-256
-    // into a 32-byte fingerprint that is embedded in each peer's TLS certificate
-    // and verified on every handshake. Only peers with the same Key can connect.
+    // Key is a pre-shared cluster admission secret. Any length; hashed with
+    // SHA-256 into a 32-byte fingerprint embedded in each peer's TLS cert
+    // and verified on every handshake.
     Key []byte
 
-    // Enabled turns PSK admission control on. When false, any peer reaching the
-    // listener can complete the TLS handshake (transport is still encrypted).
+    // Enabled turns PSK admission control on. When false, any peer reaching
+    // the listener can complete the TLS handshake (transport stays encrypted).
     Enabled bool
 }
 ```
-
-> **Note:** All peers in the cluster must use the same port. DNS only provides IP addresses,
-> so the library assumes all peers listen on the configured port.
 
 ## How It Works
 
 ### Peer Discovery
 
-1. On `Start()`, the library resolves `DNSAddr` to get initial peer IPs
-2. Sends JOIN message to all discovered peers
-3. Other peers add the new member to their peer list
+1. On `Start`, the library resolves `DNSAddr` to get initial peer IPs.
+2. For each IP it dials a QUIC connection to `<ip>:<Port>`.
+3. The successful TLS+QUIC handshake = JOIN. No application-level handshake.
+4. When a connection drops or `MaxIdleTimeout` fires, the peer is removed
+   and `OnPeerLeave` fires. Locks held by that peer are released.
 
-### Membership Protocol
+### Wire Protocol
 
-The library uses a simple internal protocol:
+Every QUIC stream carries exactly one logical message. The first byte is the
+`MsgType`:
 
-| Message | Purpose |
-|---------|---------|
-| JOIN | Announce joining the cluster |
-| LEAVE | Announce graceful departure |
-| HEARTBEAT | Periodic keepalive |
-| DATA | User data message |
-| REQUEST | Request message expecting a response |
-| RESPONSE | Response to a request message |
-| LOCK_REQUEST | Request to acquire a distributed lock |
-| LOCK_GRANT | Grant lock to requester |
-| LOCK_DENY | Deny lock (already held) |
-| LOCK_RELEASE | Notify lock has been released |
+| Hex | Type | Frame |
+|----:|------|-------|
+| `0x10` | `Data` | `[0x10][TypeLen:2][Type:T] <body until FIN>` |
+| `0x20` | `Request` | `[0x20][RequestID:16][TypeLen:2][Type:T][BodyLen:varint][Body]` |
+| `0x21` | `Response` | `[0x21][RequestID:16][BodyLen:varint][Body]` |
+| `0x30` | `LockRequest` | `[0x30][RequestID:16][KeyLen:2][Key]` |
+| `0x31` | `LockGrant` | `[0x31][RequestID:16][KeyLen:2][Key]` |
+| `0x32` | `LockDeny` | `[0x32][RequestID:16][KeyLen:2][Key]` |
+| `0x33` | `LockRelease` | `[0x33][RequestID:16][KeyLen:2][Key]` |
 
-- **JOIN**: Sent on startup to all known peers
-- **HEARTBEAT**: Sent every `HeartbeatInterval` to all peers
-- **LEAVE**: Sent on `Stop()` to notify peers of graceful shutdown
-- **Timeout**: Peers not seen within `HeartbeatTimeout` are removed
+Notes:
+- `Data` bodies are **FIN-delimited** — the sender doesn't need to know the
+  full size up-front, and the receiver can deliver the body to a handler as
+  an `io.Reader` without buffering. This is what `SendStream` / `HandleStream`
+  use.
+- `Request` / `Response` bodies are length-prefixed (varint) so the receiver
+  can enforce `MaxMessageSize` before allocating.
+- The protocol version is negotiated by ALPN (`"alan/2"`). Peers with a
+  different ALPN fail the TLS handshake.
 
 ### Message Ordering
 
-Messages from the same peer are guaranteed to be processed in order:
+- **Byte handlers** (`Handle`): messages from the same peer are dispatched in
+  order. Each peer has a dedicated channel and worker goroutine.
+- **Stream handlers** (`HandleStream`): each accepted stream spawns its own
+  goroutine and reads the body directly. Messages from the same peer may be
+  processed concurrently. If you need ordered streaming, register a byte
+  handler and dispatch internally.
 
-- Each peer has a dedicated message queue (per-peer channel)
-- A worker goroutine processes messages from each queue sequentially
-- This ensures DATA and REQUEST messages from the same peer are handled in the order received
-- Queue size is configurable via `MessageQueueSize` (default: 256)
-- When a queue is full, the listener blocks (backpressure)
-- Queues are automatically cleaned up when peers leave or timeout
+### Message Size Limits
 
-### Peer Event Ordering
+The bytes-API is capped by `Config.MaxMessageSize` (default 16 MiB):
 
-Peer join/leave events are also processed in order:
+- Sender pre-flight: `Send` / `SendTo` / `Reply` / `*AndWaitReply` return
+  `ErrMessageTooLarge` immediately if `len(data) > MaxMessageSize`.
+- Receiver enforcement: `Request` / `Response` frames carry a varint length;
+  the receiver checks it against `MaxMessageSize` *before* allocating. A
+  malicious peer cannot OOM you with a 4 GiB length announcement.
+- Byte data messages: the body is read via `io.LimitReader(stream, max+1)`;
+  if the receiver reads more than the cap, the message is dropped.
+- Streaming (`SendStream` / `HandleStream`) bypasses the cap entirely; the
+  handler is responsible for bounding its own reads.
 
-- A single event queue handles all `OnPeerJoin` and `OnPeerLeave` callbacks
-- Events are processed sequentially by a dedicated worker
-- When the queue is full, the listener blocks (backpressure)
-- This ensures handlers see events in the order they occurred
+### Per-peer Backpressure
+
+For byte handlers, each peer's queue tracks both:
+- `MessageQueueSize` — count of pending messages (default 256)
+- `MessageQueueBytes` — total bytes pending (default 256 MiB)
+
+Whichever cap is hit first applies backpressure to the QUIC stream-accept
+loop, which propagates back to the sender via QUIC flow control. Stream
+handlers bypass the queue entirely.
 
 ### Secure Transport (QUIC + TLS 1.3)
 
-Alan does **not** implement its own message encryption. Instead, every peer-to-peer
-connection runs over [QUIC](https://datatracker.ietf.org/doc/html/rfc9000), which carries
-[TLS 1.3](https://datatracker.ietf.org/doc/html/rfc8446) inside its handshake. This gives
-the cluster strong, modern security with no application-level crypto code:
+Alan does **not** implement its own message encryption. Every peer-to-peer
+connection runs over [QUIC](https://datatracker.ietf.org/doc/html/rfc9000),
+which carries [TLS 1.3](https://datatracker.ietf.org/doc/html/rfc8446) inside
+its handshake. This gives the cluster strong, modern security with no
+application-level crypto code:
 
-1. **One UDP socket, QUIC on top.** Alan opens a single UDP socket on the configured
-   port and hands it to `quic.Transport`. Every peer is reached by establishing a QUIC
-   connection to that peer's `udp:host:port`; membership/data/lock messages then travel
-   over QUIC streams.
-2. **TLS 1.3 handshake on first contact.** Before any application bytes flow, QUIC runs
-   a TLS 1.3 handshake. This negotiates an AEAD cipher suite (typically AES-128-GCM,
-   AES-256-GCM, or ChaCha20-Poly1305 — chosen by the TLS stack), performs an ECDHE key
-   exchange, and derives per-direction traffic keys. Both 0-RTT and full handshakes
-   produce a forward-secret session.
+1. **One UDP socket, QUIC on top.** Alan opens a single UDP socket on the
+   configured port and hands it to `quic.Transport`. Every peer is reached
+   by establishing a QUIC connection to that peer's `udp:host:port`;
+   membership/data/lock messages travel over QUIC streams.
+2. **TLS 1.3 handshake on first contact.** Before any application bytes
+   flow, QUIC runs a TLS 1.3 handshake. This negotiates an AEAD cipher
+   suite (AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305 — chosen by the
+   TLS stack), performs an ECDHE key exchange, and derives per-direction
+   traffic keys with full forward secrecy.
 3. **Mutual TLS (mTLS).** Both sides present a certificate (`ClientAuth =
-   RequireAnyClientCert`). On startup each peer generates an **ephemeral self-signed
-   ECDSA P-256 certificate** in memory — there are no files or CAs to manage.
-4. **ALPN pins the protocol.** The handshake advertises a single ALPN identifier,
-   `alan/1`. A peer speaking a different protocol on the same port is rejected before
-   any frames are read.
-5. **Optional pre-shared key for cluster admission.** When `SecurityConfig.Enabled` is
-   true, the SHA-256 fingerprint of `Key` is embedded into the certificate's
-   `Subject.Organization` field. The TLS `VerifyPeerCertificate` callback compares the
-   fingerprint on the peer's cert to the local one and fails the handshake on mismatch
-   (`"PSK mismatch: peer not in cluster"`). Without a matching key, no QUIC connection,
-   no streams, no data — the peer simply cannot join.
-6. **Encrypted, authenticated, and integrity-protected.** Once the handshake completes,
-   *every* QUIC packet — including the membership protocol (JOIN / LEAVE / HEARTBEAT),
-   user data, requests/responses, and lock RPCs — is encrypted and authenticated by the
-   negotiated AEAD. QUIC also encrypts most of its own headers, so on-path observers
-   see only opaque UDP datagrams.
-7. **Connection-level keep-alive and idle timeout.** QUIC keeps the secure session alive
-   with its own keep-alives and tears it down on `MaxIdleTimeout`, so a crashed peer's
-   session does not linger.
+   RequireAnyClientCert`). On startup each peer generates an **ephemeral
+   self-signed ECDSA P-256 certificate** in memory — there are no files
+   or CAs to manage.
+4. **ALPN pins the protocol.** The handshake advertises a single ALPN
+   identifier, `alan/2`. A peer speaking a different ALPN is rejected
+   before any frames are read; this is also how alan version-bumps the
+   wire protocol cleanly.
+5. **Optional pre-shared key for cluster admission.** When
+   `SecurityConfig.Enabled` is true, the SHA-256 fingerprint of `Key` is
+   embedded into the certificate's `Subject.Organization` field. The TLS
+   `VerifyPeerCertificate` callback compares it with a constant-time
+   compare and fails the handshake on mismatch (`"PSK mismatch: peer not
+   in cluster"`).
+6. **Encrypted, authenticated, and integrity-protected.** Once the
+   handshake completes, *every* QUIC packet — including membership
+   protocol, user data, requests/responses, lock RPCs — is encrypted and
+   authenticated by the negotiated AEAD. QUIC also encrypts most of its
+   own headers, so on-path observers see only opaque UDP datagrams.
+7. **Connection-level keep-alive and idle timeout.** QUIC keeps the
+   secure session alive with its own keep-alives and tears it down on
+   `MaxIdleTimeout`, so a crashed peer's session does not linger.
 
-In short: confidentiality, integrity, peer authentication, and forward secrecy are all
-provided by QUIC/TLS 1.3. The optional pre-shared key adds *cluster membership*
-authentication on top — it controls *who* may join, not *whether* traffic is encrypted.
+In short: confidentiality, integrity, peer authentication, and forward
+secrecy come from QUIC/TLS 1.3. The optional pre-shared key adds *cluster
+membership* authentication on top — it controls *who* may join, not
+*whether* traffic is encrypted.
+
+#### How mTLS and self-signed certs are safe here
+
+The classic objection to self-signed certs is "no CA vouches for the
+identity, so you don't know who you're talking to." Alan sidesteps this by
+**redefining what identity means** for a peer.
+
+Standard web PKI:
+- Identity = DNS name
+- Trust anchor = a CA in the OS root store
+
+Alan:
+- Identity = "member of *this* cluster"
+- Trust anchor = the **pre-shared key**, embedded into each cert's
+  `Subject.Organization` and verified on every handshake
+
+Threat coverage:
+
+| Threat | Why it fails |
+|--------|--------------|
+| Random attacker dials your port | No PSK → certificate's `Organization` doesn't match → `VerifyPeerCertificate` rejects |
+| Stolen certificate (it's public anyway) | Without the matching private key, the attacker cannot sign the TLS `CertificateVerify` — handshake fails. Private keys live only in the issuing peer's RAM |
+| MITM proxies traffic | The MITM has to terminate TLS on both legs and present its own cert. Without the PSK it cannot forge a cert with the right `Organization`; the verifier rejects |
+| Insider leaves with cert | Rotate `SecurityConfig.Key` → all peers regenerate certs with a new PSK fingerprint → old cert no longer matches. No CRL needed |
+| Cert/key leaked from disk | Keys are never written to disk — `generatePSKCert` keeps them in process memory and they die with the process |
+| Algorithm/cipher downgrade | TLS 1.3 only (QUIC requirement) + ALPN `alan/2` so a peer speaking a different protocol is rejected before any frame is read |
+
+Forward secrecy: TLS 1.3 mandates ephemeral ECDHE, so even if
+`SecurityConfig.Key` later leaks, previously captured ciphertext cannot be
+decrypted — the PSK is only used for *admission*, never for deriving traffic
+keys.
+
+When `SecurityConfig.Enabled` is false the channel is still TLS-encrypted,
+but any peer can join. That is fine on a closed network (private VPC,
+pod-to-pod inside a cluster) but should not be exposed to untrusted networks.
 
 ## API Reference
 
@@ -562,80 +566,134 @@ authentication on top — it controls *who* may join, not *whether* traffic is e
 
 | Function | Description |
 |----------|-------------|
-| `New(Config)` | Create new Alan instance |
-| `SetDefault(*Alan)` | Register process-wide default instance |
-| `Default() (*Alan, error)` | Get the default instance |
-| `MustDefault() *Alan` | Get the default instance or panic |
-| `HasDefault() bool` | Report whether a default has been set |
+| `New(Config)` | Create a new instance |
+| `SetDefault(*Alan)` | Register a process-wide default |
+| `Default() (*Alan, error)` | Get the default; `ErrNoDefault` if unset |
+| `MustDefault() *Alan` | Get the default; panics if unset |
+| `HasDefault() bool` | Whether a default is registered |
 
-### Alan
+### Lifecycle / discovery
 
 | Method | Description |
 |--------|-------------|
-| `OnPeerJoin(handler)` | Set callback for peer join events |
-| `OnPeerLeave(handler)` | Set callback for peer leave events |
-| `Start(ctx, handler)` | Start the peer discovery system (blocking) |
-| `Stop()` | Gracefully stop and notify peers |
-| `Send(ctx, data)` | Send data to all peers (waits for quorum if enabled) |
-| `SendTo(addr, data)` | Send data to a specific peer (no quorum check) |
-| `SendAndWaitReply(ctx, data)` | Send request to all peers and wait for responses |
-| `SendToAndWaitReply(ctx, addr, data)` | Send request to specific peer and wait for response |
-| `Reply(msg, data)` | Send response to a request message |
-| `Lock(ctx, key)` | Acquire a distributed lock (blocking) |
-| `TryLock(key)` | Try to acquire a lock (non-blocking) |
-| `Unlock(key)` | Release a distributed lock |
-| `RunAsLeader(ctx, key, fn)` | Acquire lock, run fn while holding it, release on return |
-| `LeaderLoop(ctx, key, retry, fn)` | Continuously re-acquire and run fn until ctx cancelled |
-| `HasQuorum()` | Check if quorum is currently met |
-| `WaitForQuorum(ctx)` | Block until quorum is reached |
-| `QuorumSize()` | Get required peer count for quorum |
-| `Peers()` | Get list of current peer addresses |
-| `PeerCount()` | Get number of connected peers |
+| `Start(ctx)` | Start the discovery system (blocking) |
+| `Stop()` | Gracefully stop |
+| `Ready() <-chan struct{}` | Closed when ready |
 | `Refresh()` | Manually re-resolve DNS |
-| `Ready()` | Returns channel closed when ready to send/receive |
-| `LocalAddr()` | Get local listening address |
-| `IsSecure()` | Report whether the pre-shared cluster key is enabled (transport is always encrypted by QUIC) |
-| `Config()` | Get current configuration |
+| `Peers()` | Current peer addresses |
+| `PeerCount()` | Peer count |
+| `LocalAddr()` | Local listening address |
+| `IsSecure()` | PSK admission enabled? |
+| `Config()` | Snapshot of the configuration |
+| `OnPeerJoin(handler)` | Set the join callback |
+| `OnPeerLeave(handler)` | Set the leave callback |
+
+### Messaging
+
+| Method | Description |
+|--------|-------------|
+| `Handle(type, handler)` | Register a byte handler for `type` |
+| `HandleStream(type, handler)` | Register a streaming handler for `type` |
+| `Remove(type)` | Remove handler(s) for `type` |
+| `Send(ctx, type, data) []SendResult` | Broadcast bytes to all peers |
+| `SendTo(ctx, addr, type, data)` | Send bytes to one peer |
+| `SendStream(ctx, type, body)` | Broadcast streaming body to all peers (serial) |
+| `SendToStream(ctx, addr, type, body)` | Stream body to one peer |
+| `SendAndWaitReply(ctx, type, data)` | RPC broadcast — collect responses |
+| `SendToAndWaitReply(ctx, addr, type, data)` | RPC to one peer |
+| `Reply(ctx, msg, data)` | Respond to a request message |
+
+### Locks / leader election
+
+| Method | Description |
+|--------|-------------|
+| `Lock(ctx, key)` | Acquire (blocking) |
+| `TryLock(ctx, key)` | Acquire (non-blocking) |
+| `Unlock(ctx, key)` | Release |
+| `RunAsLeader(ctx, key, fn)` | Acquire, run `fn`, release |
+| `LeaderLoop(ctx, key, retry, fn)` | Continuously re-acquire and run `fn` |
+
+### Quorum
+
+| Method | Description |
+|--------|-------------|
+| `HasQuorum()` | Snapshot |
+| `WaitForQuorum(ctx)` | Block until reached |
+| `QuorumSize()` | Required peer count |
+| `HasAllPeers()` / `WaitAll(ctx)` | Full-membership variants |
 
 ### Types
 
 ```go
-// Message received from a peer
 type Message struct {
-    Data []byte       // Decrypted payload
-    Addr *net.UDPAddr // Sender's address
+    Type string       // matched handler type
+    Data []byte       // body for byte handlers; empty for stream handlers
+    Addr *net.UDPAddr // sender
+    Size int64        // body length, or -1 if unknown (Data messages on the read path)
 }
-
-// Check if message is a request expecting a reply
 func (m Message) IsRequest() bool
 
-// Reply received from a peer (for request-reply pattern)
 type Reply struct {
-    Data []byte       // Response payload
-    Addr *net.UDPAddr // Responder's address
+    Data []byte
+    Addr *net.UDPAddr
 }
 
-// Result of sending to a peer
 type SendResult struct {
     Addr  *net.UDPAddr
-    Sent  int
+    Sent  int64
     Error error
 }
 
-// Callbacks
-type PeerHandler func(addr *net.UDPAddr)
+type PeerHandler    func(addr *net.UDPAddr)
 type MessageHandler func(ctx context.Context, msg Message)
-
-// Errors
-var ErrPeerDisconnected = errors.New("peer disconnected before responding")
-var ErrNoQuorum = errors.New("quorum not reached")
-var ErrLockNotHeld = errors.New("lock not held by this instance")
-var ErrNoDefault = errors.New("alan: no default instance set")
+type StreamHandler  func(ctx context.Context, msg Message, body io.Reader) error
 ```
+
+### Errors
+
+```go
+var (
+    ErrEmptyKey         // Security.Enabled with empty Key
+    ErrAlreadyStarted   // Start called on running instance
+    ErrNotStarted       // operation requires Start
+    ErrPeerDisconnected // peer left mid-RPC
+    ErrNoQuorum         // quorum not currently met
+    ErrLockNotHeld      // Unlock called for lock not held here
+    ErrNoPeerConnection // no live QUIC conn for target
+    ErrMessageTooLarge  // bytes-API exceeds MaxMessageSize
+    ErrDuplicateHandler // both Handle and HandleStream for same type
+    ErrTypeTooLong      // message type > 65535 bytes
+    ErrFrameTooLarge    // wire frame announced > MaxMessageSize
+    ErrNoDefault        // global Default() with none set
+)
+```
+
+## Upgrading from an earlier version
+
+This release breaks both source compatibility and wire compatibility:
+
+- **Wire (ALPN bump):** the protocol identifier moved from `alan/1` to
+  `alan/2`. Old peers fail the TLS handshake against new peers — there is
+  no silent corruption. Upgrade all peers together.
+- **Source:** every `Send` / `SendTo` / `SendStream` / `SendToStream` /
+  `SendAndWaitReply` / `SendToAndWaitReply` / `Reply` / `Lock` / `TryLock` /
+  `Unlock` call now takes `context.Context` as the first argument. Pass
+  `context.Background()` if you need today's behaviour.
+- **Frame format:** `Data` messages are now FIN-delimited (no length prefix);
+  `Request` / `Response` use varint lengths. Application-level message types
+  are unaffected — only the wire encoding changed.
+- **Receiver safety:** every length-prefixed frame is bounded by
+  `Config.MaxMessageSize` (default 16 MiB). Switch to `SendStream` /
+  `HandleStream` to lift the cap for a specific message type.
+- **Application encryption removed:** earlier versions documented optional
+  ChaCha20-Poly1305 at the application layer. That is gone — encryption now
+  comes from QUIC/TLS 1.3 (also AEAD; cipher suite is negotiated by TLS).
+  `SecurityConfig.Key` now controls cluster admission, not data encryption.
 
 ## UDP Buffer Size (Linux)
 
-QUIC performs best with larger UDP buffers. If you see a warning about receive buffer size, increase the OS limits:
+QUIC performs best with larger UDP buffers. If you see a warning about
+receive buffer size, increase the OS limits:
 
 ```bash
 sudo sysctl -w net.core.rmem_max=7500000
@@ -649,9 +707,9 @@ net.core.rmem_max=7500000
 net.core.wmem_max=7500000
 ```
 
-This is optional — the application works without it, but may drop packets under heavy load.
-
+This is optional — the application works without it, but may drop packets
+under heavy load.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
