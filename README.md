@@ -6,13 +6,13 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/rakunlabs/alan?style=flat-square)](https://goreportcard.com/report/github.com/rakunlabs/alan)
 [![Go PKG](https://raw.githubusercontent.com/rakunlabs/.github/main/assets/badges/gopkg.svg)](https://pkg.go.dev/github.com/rakunlabs/alan)
 
-UDP peer discovery and communication library for Go with optional ChaCha20-Poly1305 encryption.
+QUIC-based peer discovery and communication library for Go. All peer-to-peer traffic is secured by QUIC's built-in TLS 1.3.
 
 ## Features
 
 - **DNS-based peer discovery** - Resolve a DNS name to discover cluster members
 - **Automatic membership** - JOIN/LEAVE/HEARTBEAT protocol for peer tracking
-- **Encrypted communication** - Optional ChaCha20-Poly1305 authenticated encryption
+- **Secure transport by default** - All traffic runs over QUIC with TLS 1.3 (mTLS); optional pre-shared key restricts which peers may join the cluster
 - **Request-Reply pattern** - Send requests and wait for responses from peers
 - **Distributed locking** - Named locks with automatic release on peer disconnect
 - **Quorum support** - Configurable quorum requirement for distributed operations
@@ -141,20 +141,25 @@ lock-free on the hot path and `SetDefault()` is safe from any goroutine.
 > (two `Alan` instances), prefer passing `*Alan` as a dependency. The global
 > is a convenience for the common single-cluster case.
 
-## With Encryption
+## Cluster Admission (Pre-Shared Key)
+
+Traffic is **always** encrypted by QUIC/TLS 1.3 — there is no insecure mode. To restrict
+*which* peers may join your cluster, configure a pre-shared key. Only peers presenting a
+TLS certificate bound to the same key are accepted during the handshake.
 
 ```go
 a, err := alan.New(alan.Config{
     DNSAddr: "my-cluster.local",
     Port:    5000,
-    Security: &alan.SecurityConfig{
-        Key:     []byte("my-secret-key"), // any length, derived via Argon2id
+    Security: alan.SecurityConfig{
+        Key:     []byte("my-secret-key"), // any length, hashed into a 32-byte fingerprint
         Enabled: true,
     },
 })
 ```
 
-All messages (including membership protocol) are automatically encrypted.
+When `Enabled` is true, the same `Key` must be configured on every peer. Peers with a
+different key (or no key) will fail the TLS handshake and never become members.
 
 ## Request-Reply Pattern
 
@@ -439,14 +444,20 @@ type Config struct {
     // Quorum - expected cluster size for distributed operations (default: 0 = disabled)
     // When set, operations like Lock() and SendCtx() wait until (Quorum/2)+1 peers are present
     Quorum int
-    
-    // Security for encryption (optional)
-    Security *SecurityConfig
+
+    // Security configures the optional pre-shared key for cluster admission.
+    // Transport encryption (QUIC/TLS 1.3) is always enabled regardless of this field.
+    Security SecurityConfig
 }
 
 type SecurityConfig struct {
-    // Key can be any length; derived into a 32-byte key using Argon2id
-    Key     []byte
+    // Key is a pre-shared cluster admission secret. Any length; hashed with SHA-256
+    // into a 32-byte fingerprint that is embedded in each peer's TLS certificate
+    // and verified on every handshake. Only peers with the same Key can connect.
+    Key []byte
+
+    // Enabled turns PSK admission control on. When false, any peer reaching the
+    // listener can complete the TLS handshake (transport is still encrypted).
     Enabled bool
 }
 ```
@@ -504,14 +515,46 @@ Peer join/leave events are also processed in order:
 - When the queue is full, the listener blocks (backpressure)
 - This ensures handlers see events in the order they occurred
 
-### Security
+### Secure Transport (QUIC + TLS 1.3)
 
-When encryption is enabled:
-- All messages (JOIN/LEAVE/HEARTBEAT/DATA) are encrypted
-- Uses XChaCha20-Poly1305 (AEAD)
-- Key is derived from the provided passphrase using Argon2id
-- Random 24-byte nonce per message
-- Wire format: `[nonce:24][ciphertext+tag]`
+Alan does **not** implement its own message encryption. Instead, every peer-to-peer
+connection runs over [QUIC](https://datatracker.ietf.org/doc/html/rfc9000), which carries
+[TLS 1.3](https://datatracker.ietf.org/doc/html/rfc8446) inside its handshake. This gives
+the cluster strong, modern security with no application-level crypto code:
+
+1. **One UDP socket, QUIC on top.** Alan opens a single UDP socket on the configured
+   port and hands it to `quic.Transport`. Every peer is reached by establishing a QUIC
+   connection to that peer's `udp:host:port`; membership/data/lock messages then travel
+   over QUIC streams.
+2. **TLS 1.3 handshake on first contact.** Before any application bytes flow, QUIC runs
+   a TLS 1.3 handshake. This negotiates an AEAD cipher suite (typically AES-128-GCM,
+   AES-256-GCM, or ChaCha20-Poly1305 — chosen by the TLS stack), performs an ECDHE key
+   exchange, and derives per-direction traffic keys. Both 0-RTT and full handshakes
+   produce a forward-secret session.
+3. **Mutual TLS (mTLS).** Both sides present a certificate (`ClientAuth =
+   RequireAnyClientCert`). On startup each peer generates an **ephemeral self-signed
+   ECDSA P-256 certificate** in memory — there are no files or CAs to manage.
+4. **ALPN pins the protocol.** The handshake advertises a single ALPN identifier,
+   `alan/1`. A peer speaking a different protocol on the same port is rejected before
+   any frames are read.
+5. **Optional pre-shared key for cluster admission.** When `SecurityConfig.Enabled` is
+   true, the SHA-256 fingerprint of `Key` is embedded into the certificate's
+   `Subject.Organization` field. The TLS `VerifyPeerCertificate` callback compares the
+   fingerprint on the peer's cert to the local one and fails the handshake on mismatch
+   (`"PSK mismatch: peer not in cluster"`). Without a matching key, no QUIC connection,
+   no streams, no data — the peer simply cannot join.
+6. **Encrypted, authenticated, and integrity-protected.** Once the handshake completes,
+   *every* QUIC packet — including the membership protocol (JOIN / LEAVE / HEARTBEAT),
+   user data, requests/responses, and lock RPCs — is encrypted and authenticated by the
+   negotiated AEAD. QUIC also encrypts most of its own headers, so on-path observers
+   see only opaque UDP datagrams.
+7. **Connection-level keep-alive and idle timeout.** QUIC keeps the secure session alive
+   with its own keep-alives and tears it down on `MaxIdleTimeout`, so a crashed peer's
+   session does not linger.
+
+In short: confidentiality, integrity, peer authentication, and forward secrecy are all
+provided by QUIC/TLS 1.3. The optional pre-shared key adds *cluster membership*
+authentication on top — it controls *who* may join, not *whether* traffic is encrypted.
 
 ## API Reference
 
@@ -551,7 +594,7 @@ When encryption is enabled:
 | `Refresh()` | Manually re-resolve DNS |
 | `Ready()` | Returns channel closed when ready to send/receive |
 | `LocalAddr()` | Get local listening address |
-| `IsSecure()` | Check if encryption is enabled |
+| `IsSecure()` | Report whether the pre-shared cluster key is enabled (transport is always encrypted by QUIC) |
 | `Config()` | Get current configuration |
 
 ### Types

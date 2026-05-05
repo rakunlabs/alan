@@ -1,11 +1,11 @@
 # Alan TUI Chat Example
 
-A terminal-based peer-to-peer chat application using the Alan library for encrypted UDP communication.
+A terminal-based peer-to-peer chat application using the Alan library for secure QUIC-based communication.
 
 ## Features
 
 - Real-time peer-to-peer messaging
-- End-to-end encryption (ChaCha20-Poly1305)
+- Encrypted transport via QUIC (TLS 1.3, mTLS) with optional pre-shared cluster key
 - Peer list showing connected users
 - Message timestamps
 - Color-coded messages per peer
@@ -44,8 +44,8 @@ ALAN_BIND_ADDR=127.0.1.3 ALAN_NAME=Eray go run .
 | `ALAN_BIND_ADDR` | `0.0.0.0` | Local IP address to bind to |
 | `ALAN_DNS_ADDR` | `alan-chat.local` | DNS name for peer discovery |
 | `ALAN_PORT` | `5000` | UDP port (must be same for all peers) |
-| `ALAN_SECURITY_KEY` | `alan-chat-default-key` | Encryption key, any length (must be same for all peers) |
-| `ALAN_SECURITY_ENABLED` | `true` | Enable/disable encryption |
+| `ALAN_SECURITY_KEY` | `alan-chat-default-key` | Pre-shared cluster admission key, any length (must be same for all peers) |
+| `ALAN_SECURITY_ENABLED` | `true` | Enable/disable PSK admission check (transport stays encrypted via QUIC either way) |
 
 ## Controls
 
