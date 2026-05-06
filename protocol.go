@@ -30,6 +30,12 @@ const (
 	MsgTypeLockDeny byte = 0x32
 	// MsgTypeLockRelease notifies that a lock has been released.
 	MsgTypeLockRelease byte = 0x33
+	// MsgTypeLeave is a graceful leave announcement. The frame consists of
+	// just the type byte (no body, no length prefix). The sender's identity
+	// is taken from the QUIC connection's RemoteAddr. Receivers fire the
+	// OnPeerLeave callback immediately rather than waiting for the QUIC
+	// idle timeout to detect the disconnection.
+	MsgTypeLeave byte = 0x40
 )
 
 // RequestIDSize is the size of request/response correlation IDs in bytes.
@@ -279,6 +285,16 @@ func readLockFrame(r io.Reader) (reqID []byte, key string, err error) {
 		return nil, "", err
 	}
 	return reqID, string(keyBuf), nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Leave frame: [MsgTypeLeave:1]
+// ─────────────────────────────────────────────────────────────────────────────
+
+// writeLeaveFrame writes a graceful leave announcement (just the type byte).
+// The caller is expected to FIN the stream after this returns.
+func writeLeaveFrame(w io.Writer) error {
+	return writeMsgType(w, MsgTypeLeave)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

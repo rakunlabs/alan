@@ -1,6 +1,7 @@
 package alan
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,12 +13,21 @@ import (
 )
 
 // Lock acquires a named distributed lock, blocking until acquired or ctx is cancelled.
+//
+// Quorum is enforced on every retry, not just on entry: if the cluster
+// loses quorum (e.g. enough peers leave to drop PeerCount below
+// QuorumSize), Lock will block waiting for peers to return rather than
+// granting the lock to a partition that lacks majority.
 func (a *Alan) Lock(ctx context.Context, key string) error {
-	if err := a.waitForQuorum(ctx); err != nil {
-		return err
-	}
-
 	for {
+		// Re-check quorum on every iteration. Without this, a survivor
+		// that was waiting on a holder which then disconnected would
+		// re-enter tryAcquireLock with zero peers and silently grant
+		// itself the lock — defeating the Replicas guard.
+		if err := a.waitForQuorum(ctx); err != nil {
+			return err
+		}
+
 		acquired, waitCh := a.tryAcquireLock(ctx, key)
 		if acquired {
 			return nil
@@ -89,35 +99,43 @@ func (a *Alan) Unlock(ctx context.Context, key string) error {
 
 // tryAcquireLock attempts to acquire a lock and returns either acquired=true,
 // or a waitCh on which the caller can block until the current holder releases.
+//
+// When multiple peers race for the same fresh lock, ties are broken by
+// lexicographic comparison of the random requestID: the lower requestID
+// wins. This is symmetric and deterministic — both sides of any pair
+// reach the same conclusion without further coordination.
+//
+// To close the race window between "I broadcast my request" and
+// "competing request arrives", the local lock state is marked with the
+// outgoing requestID *before* the broadcast. Subsequent incoming
+// requests on this peer can then tie-break against our pending ID even
+// if they arrive faster than we can register grant handlers.
 func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struct{}) {
 	a.locksMu.Lock()
 
-	state, exists := a.locks[key]
-	if exists {
-		if state.holder == nil {
+	if state, exists := a.locks[key]; exists {
+		if state.holder == nil && state.pending == nil {
+			// We already self-hold this lock locally.
 			a.locksMu.Unlock()
 			return true, nil
 		}
+		// Either remotely held, or we have an in-flight acquisition
+		// from another caller. Park as a waiter.
 		waitCh := make(chan struct{}, 1)
 		state.waiters = append(state.waiters, waitCh)
 		a.locksMu.Unlock()
 		return false, waitCh
 	}
 
-	a.locksMu.Unlock()
-
 	peerConns := a.peers.connAddrs()
 	if len(peerConns) == 0 {
-		a.locksMu.Lock()
-		if state, exists := a.locks[key]; exists {
-			if state.holder == nil {
-				a.locksMu.Unlock()
-				return true, nil
-			}
-			waitCh := make(chan struct{}, 1)
-			state.waiters = append(state.waiters, waitCh)
+		// No peers to ask. Only grant the lock locally if quorum allows
+		// it — otherwise we would create a split-brain leader that holds
+		// a lock no other replica acknowledges. With Replicas=0 the
+		// instance is standalone and HasQuorum is always true.
+		if !a.HasQuorum() {
 			a.locksMu.Unlock()
-			return false, waitCh
+			return false, nil
 		}
 		a.locks[key] = &lockState{holder: nil, waiters: nil}
 		a.locksMu.Unlock()
@@ -126,55 +144,108 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 
 	requestID := make([]byte, RequestIDSize)
 	if _, err := rand.Read(requestID); err != nil {
+		a.locksMu.Unlock()
 		return false, nil
 	}
 
+	// Publish our intent to the local lock state map BEFORE broadcasting,
+	// so any concurrent peer request that arrives sees our pending
+	// requestID and applies the tie-break correctly.
+	a.locks[key] = &lockState{holder: nil, pending: requestID, waiters: nil}
+	a.locksMu.Unlock()
+
 	reqKey := hex.EncodeToString(requestID)
 	pending := &pendingLock{
-		grantCh: make(chan *net.UDPAddr, len(peerConns)),
-		denyCh:  make(chan *net.UDPAddr, len(peerConns)),
+		requestID: requestID,
+		key:       key,
+		peerLeft:  make(chan *net.UDPAddr, len(peerConns)),
+		grantCh:   make(chan *net.UDPAddr, len(peerConns)),
+		denyCh:    make(chan *net.UDPAddr, len(peerConns)),
+		preempted: make(chan struct{}, 1),
 	}
 	a.pendingLocksMu.Lock()
 	a.pendingLocks[reqKey] = pending
 	a.pendingLocksMu.Unlock()
-	defer func() {
+
+	// Cleanup helper: removes our pending state. If acquired, transitions
+	// to self-held; otherwise, drops the pending marker so other callers
+	// or remote requests see a clean slate.
+	cleanup := func(acquired bool) {
 		a.pendingLocksMu.Lock()
 		delete(a.pendingLocks, reqKey)
 		a.pendingLocksMu.Unlock()
-	}()
+
+		a.locksMu.Lock()
+		if state, exists := a.locks[key]; exists {
+			// If we were preempted, holder may already be set by
+			// handleLockRequest; don't clobber it.
+			if state.holder == nil && bytes.Equal(state.pending, requestID) {
+				if acquired {
+					state.pending = nil
+				} else {
+					delete(a.locks, key)
+				}
+			}
+		}
+		a.locksMu.Unlock()
+	}
 
 	a.broadcastLockRequest(ctx, requestID, key)
 
 	grants := 0
-	needed := len(peerConns)
+	// Track peers we still expect a response from. A peer disconnect
+	// drops the corresponding "needed" slot so the acquisition does
+	// not block forever waiting on a dead peer.
+	expecting := make(map[string]struct{}, len(peerConns))
+	for _, pc := range peerConns {
+		expecting[pc.Addr.String()] = struct{}{}
+	}
+	needed := len(expecting)
+
+	// On abort, we must broadcast a Release to every peer. This is
+	// because peers may have set holder = us locally even without
+	// sending us an explicit grant — specifically, when their own
+	// concurrent acquisition was preempted by ours, they store
+	// holder = us speculatively. If we don't tell them we're aborting,
+	// they'll be stuck thinking we hold the lock and refuse all
+	// subsequent acquisitions.
+	abort := func() {
+		cleanup(false)
+		// Best-effort: release on every peer so any speculative
+		// holder = us state is cleared cluster-wide.
+		releaseCtx, cancel := context.WithTimeout(context.Background(), a.config.Timeout)
+		defer cancel()
+		a.broadcastLockRelease(releaseCtx, key)
+	}
 
 	for grants < needed {
 		select {
 		case <-ctx.Done():
+			abort()
 			return false, nil
-		case <-pending.grantCh:
+		case <-pending.preempted:
+			abort()
+			return false, nil
+		case grantor := <-pending.grantCh:
+			if grantor != nil {
+				delete(expecting, grantor.String())
+			}
 			grants++
 		case <-pending.denyCh:
-			a.locksMu.Lock()
-			state, exists := a.locks[key]
-			if !exists {
-				state = &lockState{holder: nil, waiters: nil}
-				a.locks[key] = state
+			abort()
+			return false, nil
+		case dead := <-pending.peerLeft:
+			if dead == nil {
+				continue
 			}
-			waitCh := make(chan struct{}, 1)
-			state.waiters = append(state.waiters, waitCh)
-			a.locksMu.Unlock()
-			return false, waitCh
+			if _, ok := expecting[dead.String()]; ok {
+				delete(expecting, dead.String())
+				needed--
+			}
 		}
 	}
 
-	a.locksMu.Lock()
-	if state, exists := a.locks[key]; exists && state.holder == nil {
-		a.locksMu.Unlock()
-		return true, nil
-	}
-	a.locks[key] = &lockState{holder: nil, waiters: nil}
-	a.locksMu.Unlock()
+	cleanup(true)
 	return true, nil
 }
 
@@ -228,9 +299,12 @@ func (a *Alan) sendLockResponse(ctx context.Context, msgType byte, requestID []b
 	_ = a.sendLockMsg(ctx, conn, msgType, requestID, key)
 }
 
+// releaseLocksHeldBy releases any locks the departing peer held and
+// notifies any in-flight local acquisitions that the peer disconnected
+// so they can drop it from their grant-counting set. Safe to call
+// multiple times for the same peer (idempotent).
 func (a *Alan) releaseLocksHeldBy(addr *net.UDPAddr) {
 	a.locksMu.Lock()
-	defer a.locksMu.Unlock()
 	peerKey := addr.String()
 	for key, state := range a.locks {
 		if state.holder != nil && state.holder.String() == peerKey {
@@ -244,26 +318,111 @@ func (a *Alan) releaseLocksHeldBy(addr *net.UDPAddr) {
 			}
 		}
 	}
+	a.locksMu.Unlock()
+
+	// Notify any in-flight pending acquisitions that this peer is gone
+	// so they can drop it from their needed-grants tally.
+	a.pendingLocksMu.Lock()
+	pendings := make([]*pendingLock, 0, len(a.pendingLocks))
+	for _, p := range a.pendingLocks {
+		pendings = append(pendings, p)
+	}
+	a.pendingLocksMu.Unlock()
+	for _, p := range pendings {
+		select {
+		case p.peerLeft <- addr:
+		default:
+		}
+	}
 }
 
+// handleLockRequest is called when a peer asks us for a lock.
+//
+// Decision matrix on the local lockState for key:
+//
+//   - state == nil (no entry): grant; record sourceAddr as holder.
+//   - state.holder != nil: held by someone (possibly the requester
+//     re-asking). Deny.
+//   - state.holder == nil && state.pending == nil: we self-hold the
+//     lock. Deny.
+//   - state.holder == nil && state.pending != nil: in-flight local
+//     acquisition. Tie-break by lexicographic comparison of requestIDs:
+//     the lower requestID wins. If incoming wins, grant it and
+//     preempt our own acquisition (it will retry). If we win, deny.
+//
+// Tie-break is symmetric: both peers running the same comparison reach
+// the same conclusion, so no split-brain is possible from a concurrent
+// fresh-acquire race.
 func (a *Alan) handleLockRequest(requestID []byte, key string, sourceAddr *net.UDPAddr) {
-	a.locksMu.Lock()
-	defer a.locksMu.Unlock()
-
 	ctx, cancel := context.WithTimeout(context.Background(), a.config.Timeout)
 	defer cancel()
 
+	a.locksMu.Lock()
 	state, exists := a.locks[key]
 	if !exists {
+		// Unowned, no local pending: grant.
 		a.locks[key] = &lockState{holder: sourceAddr, waiters: nil}
+		a.locksMu.Unlock()
 		a.sendLockResponse(ctx, MsgTypeLockGrant, requestID, key, sourceAddr)
 		return
 	}
-	if state.holder == nil {
+
+	if state.holder != nil {
+		// Held by some peer (possibly the requester); deny.
+		a.locksMu.Unlock()
 		a.sendLockResponse(ctx, MsgTypeLockDeny, requestID, key, sourceAddr)
 		return
 	}
+
+	// holder == nil. Either we self-hold or we have an in-flight
+	// acquisition.
+	if state.pending == nil {
+		// Self-held. Deny.
+		a.locksMu.Unlock()
+		a.sendLockResponse(ctx, MsgTypeLockDeny, requestID, key, sourceAddr)
+		return
+	}
+
+	// In-flight local acquisition. Tie-break: lower requestID wins.
+	if bytes.Compare(requestID, state.pending) < 0 {
+		// Incoming wins. Hand the lock to the source and preempt our
+		// own pending acquisition. The local acquisition goroutine
+		// will observe `preempted` and retry; its cleanup will see
+		// holder != nil and skip clobbering.
+		myPending := state.pending
+		a.locks[key] = &lockState{holder: sourceAddr, waiters: state.waiters}
+		a.locksMu.Unlock()
+
+		// Signal preemption to the in-flight pending so it gives up.
+		a.signalPreempted(myPending)
+
+		a.sendLockResponse(ctx, MsgTypeLockGrant, requestID, key, sourceAddr)
+		return
+	}
+
+	// We win; deny the incoming request. The peer will retry once we
+	// either acquire (and later release) or are denied ourselves.
+	a.locksMu.Unlock()
 	a.sendLockResponse(ctx, MsgTypeLockDeny, requestID, key, sourceAddr)
+}
+
+// signalPreempted notifies the in-flight pendingLock for the given
+// requestID that it has been preempted by a winning competing request.
+func (a *Alan) signalPreempted(requestID []byte) {
+	if len(requestID) == 0 {
+		return
+	}
+	reqKey := hex.EncodeToString(requestID)
+	a.pendingLocksMu.Lock()
+	pending, ok := a.pendingLocks[reqKey]
+	a.pendingLocksMu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case pending.preempted <- struct{}{}:
+	default:
+	}
 }
 
 func (a *Alan) handleLockGrant(requestID []byte, _ string, sourceAddr *net.UDPAddr) {
@@ -279,18 +438,8 @@ func (a *Alan) handleLockGrant(requestID []byte, _ string, sourceAddr *net.UDPAd
 	}
 }
 
-func (a *Alan) handleLockDeny(requestID []byte, key string, sourceAddr *net.UDPAddr) {
+func (a *Alan) handleLockDeny(requestID []byte, _ string, sourceAddr *net.UDPAddr) {
 	reqKey := hex.EncodeToString(requestID)
-	a.locksMu.Lock()
-	state, exists := a.locks[key]
-	if !exists {
-		state = &lockState{holder: sourceAddr, waiters: nil}
-		a.locks[key] = state
-	} else if state.holder == nil {
-		state.holder = sourceAddr
-	}
-	a.locksMu.Unlock()
-
 	a.pendingLocksMu.Lock()
 	pending, ok := a.pendingLocks[reqKey]
 	a.pendingLocksMu.Unlock()

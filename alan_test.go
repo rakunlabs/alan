@@ -511,6 +511,21 @@ func TestSendAndWaitReply(t *testing.T) {
 	}
 }
 
+// waitWithTimeout returns true if wg completed before the timeout elapsed.
+func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func TestPeerJoinLeaveCallbacks(t *testing.T) {
 	const port1 = 16011
 	const port2 = 16012
@@ -522,22 +537,24 @@ func TestPeerJoinLeaveCallbacks(t *testing.T) {
 		HeartbeatTimeout:  5 * time.Second,
 	})
 
-	var joinedPeer *net.UDPAddr
+	var joinedPeer atomic.Pointer[net.UDPAddr]
 	var joinWg sync.WaitGroup
 	joinWg.Add(1)
 
 	a1.OnPeerJoin(func(addr *net.UDPAddr) {
-		joinedPeer = addr
-		joinWg.Done()
+		if joinedPeer.CompareAndSwap(nil, addr) {
+			joinWg.Done()
+		}
 	})
 
-	var leftPeer *net.UDPAddr
+	var leftPeer atomic.Pointer[net.UDPAddr]
 	var leaveWg sync.WaitGroup
 	leaveWg.Add(1)
 
 	a1.OnPeerLeave(func(addr *net.UDPAddr) {
-		leftPeer = addr
-		leaveWg.Done()
+		if leftPeer.CompareAndSwap(nil, addr) {
+			leaveWg.Done()
+		}
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -558,16 +575,188 @@ func TestPeerJoinLeaveCallbacks(t *testing.T) {
 
 	connectPeers(t, a1, a2)
 
-	joinWg.Wait()
-	if joinedPeer == nil {
+	if !waitWithTimeout(&joinWg, 5*time.Second) {
+		t.Fatal("expected join callback to be called within 5s")
+	}
+	if joinedPeer.Load() == nil {
 		t.Fatal("expected join callback to be called")
 	}
 
 	a2.Stop()
 
-	leaveWg.Wait()
-	if leftPeer == nil {
+	if !waitWithTimeout(&leaveWg, 3*time.Second) {
+		t.Fatal("expected leave callback to be called within 3s of Stop")
+	}
+	if leftPeer.Load() == nil {
 		t.Fatal("expected leave callback to be called")
+	}
+
+	a1.Stop()
+}
+
+// TestPeerLeaveIsFast verifies the graceful-leave protocol message kicks
+// in: with a long HeartbeatTimeout, OnPeerLeave should still fire promptly
+// after the peer calls Stop, instead of waiting for the QUIC idle timer.
+func TestPeerLeaveIsFast(t *testing.T) {
+	const port1 = 16031
+	const port2 = 16032
+
+	// Long idle timeout: if the leave-announcement protocol is missing,
+	// OnPeerLeave can only fire after this elapses.
+	a1, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port1,
+		HeartbeatInterval: 5 * time.Second,
+		HeartbeatTimeout:  30 * time.Second,
+	})
+	a2, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port2,
+		HeartbeatInterval: 5 * time.Second,
+		HeartbeatTimeout:  30 * time.Second,
+	})
+
+	var leaveWg sync.WaitGroup
+	leaveWg.Add(1)
+	var fired atomic.Bool
+	a1.OnPeerLeave(func(addr *net.UDPAddr) {
+		if fired.CompareAndSwap(false, true) {
+			leaveWg.Done()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go a1.Start(ctx)
+	go a2.Start(ctx)
+	<-a1.Ready()
+	<-a2.Ready()
+
+	connectPeers(t, a1, a2)
+
+	start := time.Now()
+	a2.Stop()
+
+	if !waitWithTimeout(&leaveWg, 3*time.Second) {
+		t.Fatalf("OnPeerLeave did not fire within 3s of Stop (elapsed=%v); leave protocol may be broken", time.Since(start))
+	}
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Errorf("OnPeerLeave fired but took too long: %v", elapsed)
+	}
+
+	a1.Stop()
+}
+
+// TestPeerLeaveOnContextCancel verifies that cancelling the parent ctx
+// passed to Start (instead of calling Stop explicitly) still triggers the
+// graceful leave announcement on remote peers. This is the typical
+// pattern for applications driven by signal-handling frameworks.
+func TestPeerLeaveOnContextCancel(t *testing.T) {
+	const port1 = 16051
+	const port2 = 16052
+
+	// Long idle timeout: leave must come from the announcement, not from
+	// QUIC's own idle timer.
+	a1, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port1,
+		HeartbeatInterval: 5 * time.Second,
+		HeartbeatTimeout:  30 * time.Second,
+	})
+	a2, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port2,
+		HeartbeatInterval: 5 * time.Second,
+		HeartbeatTimeout:  30 * time.Second,
+	})
+
+	var leaveWg sync.WaitGroup
+	leaveWg.Add(1)
+	var fired atomic.Bool
+	a1.OnPeerLeave(func(addr *net.UDPAddr) {
+		if fired.CompareAndSwap(false, true) {
+			leaveWg.Done()
+		}
+	})
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+
+	go a1.Start(ctx1)
+	go a2.Start(ctx2)
+	<-a1.Ready()
+	<-a2.Ready()
+
+	connectPeers(t, a1, a2)
+
+	// Cancel a2's parent ctx — Start should run the same graceful
+	// shutdown as Stop, including the leave broadcast.
+	start := time.Now()
+	cancel2()
+
+	if !waitWithTimeout(&leaveWg, 3*time.Second) {
+		t.Fatalf("OnPeerLeave did not fire within 3s of parent ctx cancel (elapsed=%v)", time.Since(start))
+	}
+
+	a1.Stop()
+}
+
+// TestPeerLeaveOnAbruptClose codifies the idle-timeout fallback: when a
+// peer is torn down without sending a graceful leave, the remote should
+// still eventually fire OnPeerLeave once the QUIC idle timer expires.
+func TestPeerLeaveOnAbruptClose(t *testing.T) {
+	const port1 = 16041
+	const port2 = 16042
+
+	// Short idle timeout so the test finishes quickly.
+	a1, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port1,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  1500 * time.Millisecond,
+	})
+	a2, _ := New(Config{
+		BindAddr:          "127.0.0.1",
+		Port:              port2,
+		HeartbeatInterval: 200 * time.Millisecond,
+		HeartbeatTimeout:  1500 * time.Millisecond,
+	})
+
+	var leaveWg sync.WaitGroup
+	leaveWg.Add(1)
+	var fired atomic.Bool
+	a1.OnPeerLeave(func(addr *net.UDPAddr) {
+		if fired.CompareAndSwap(false, true) {
+			leaveWg.Done()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go a1.Start(ctx)
+	go a2.Start(ctx)
+	<-a1.Ready()
+	<-a2.Ready()
+
+	connectPeers(t, a1, a2)
+
+	// Simulate abrupt teardown (e.g. SIGKILL / OS reclaim): close the
+	// underlying UDP socket without going through Stop(), so no leave
+	// announcement is sent. The remote should still detect the loss via
+	// the QUIC idle timer.
+	a2.mu.RLock()
+	udpConn := a2.udpConn
+	a2.mu.RUnlock()
+	if udpConn != nil {
+		_ = udpConn.Close()
+	}
+
+	if !waitWithTimeout(&leaveWg, 5*time.Second) {
+		t.Fatal("OnPeerLeave did not fire within 5s after abrupt close")
 	}
 
 	a1.Stop()

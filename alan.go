@@ -208,15 +208,37 @@ type queuedMessage struct {
 }
 
 // lockState tracks the state of a distributed lock.
+//
+// Encoding of "who holds it":
+//   - holder == nil && pending == nil: we hold the lock locally.
+//   - holder == nil && pending != nil: we have an in-flight acquisition;
+//     pending is the local requestID used for tie-breaking.
+//   - holder != nil: a remote peer holds the lock at that address.
 type lockState struct {
 	holder  *net.UDPAddr
+	pending []byte
 	waiters []chan struct{}
 }
 
 // pendingLock tracks an in-flight lock request.
 type pendingLock struct {
-	grantCh chan *net.UDPAddr
-	denyCh  chan *net.UDPAddr
+	// requestID is the random 16-byte identifier used to correlate
+	// grants/denies and to break ties when multiple peers race for the
+	// same key (lower-valued requestID wins).
+	requestID []byte
+	// key is the lock name; used so per-peer cleanup (e.g. on peer
+	// disconnect) can find the right pending acquisition.
+	key string
+	// peerLeft is signalled when a peer the request is waiting on
+	// disconnects, so the acquisition loop can drop that peer from its
+	// "needed grants" counter rather than blocking forever.
+	peerLeft chan *net.UDPAddr
+	grantCh  chan *net.UDPAddr
+	denyCh   chan *net.UDPAddr
+	// preempted is signalled when a competing request with a smaller
+	// requestID wins the tie-break; the local acquisition aborts and
+	// retries.
+	preempted chan struct{}
 }
 
 // Alan is the QUIC peer-discovery and messaging instance.
@@ -268,6 +290,10 @@ type Alan struct {
 	byteHandlers   map[string]MessageHandler
 	streamHandlers map[string]StreamHandler
 	handlersMu     sync.RWMutex
+
+	// leader
+	leaderMu sync.RWMutex
+	leaders  map[string]struct{}
 }
 
 // New creates a new Alan instance with the given configuration.
@@ -315,6 +341,7 @@ func New(config Config) (*Alan, error) {
 		pendingLocks:    make(map[string]*pendingLock),
 		byteHandlers:    make(map[string]MessageHandler),
 		streamHandlers:  make(map[string]StreamHandler),
+		leaders:         make(map[string]struct{}),
 	}
 
 	return a, nil
@@ -387,6 +414,12 @@ func (a *Alan) Remove(msgType string) {
 
 // Start initialises the QUIC peer-discovery system. Blocks until ctx is
 // cancelled or Stop is called.
+//
+// When ctx is cancelled, Start runs the same graceful shutdown as Stop —
+// including the leave-announcement broadcast — before returning. This
+// means callers that drive lifecycle via context cancellation alone (no
+// explicit Stop call) still get prompt OnPeerLeave notifications on
+// remote peers.
 func (a *Alan) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.running {
@@ -395,8 +428,24 @@ func (a *Alan) Start(ctx context.Context) error {
 	}
 	a.running = true
 	a.stopChan = make(chan struct{})
-	a.ctx, a.cancel = context.WithCancel(ctx)
+	// a.ctx is independent of the parent ctx so that an external
+	// cancellation does not race ahead of the graceful-shutdown sequence
+	// (announceLeave needs the peers map to still be populated; if a.ctx
+	// were a child of ctx, handleConnection's defer would wipe peers as
+	// soon as the parent cancels).
+	a.ctx, a.cancel = context.WithCancel(context.Background())
 	a.mu.Unlock()
+
+	// Watch the parent ctx and trigger an orderly Stop when it cancels.
+	// Stop is idempotent so this is safe even if the user also calls it
+	// explicitly.
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = a.Stop()
+		case <-a.stopChan:
+		}
+	}()
 
 	var sharedKey []byte
 	if a.config.Security.Enabled {
@@ -481,9 +530,15 @@ func (a *Alan) Stop() error {
 	a.running = false
 	a.mu.Unlock()
 
+	// Best-effort: announce leave to all connected peers so they fire
+	// OnPeerLeave immediately rather than waiting for the QUIC idle
+	// timeout. Bounded by Config.Timeout so a slow/dead peer cannot stall
+	// shutdown indefinitely.
+	a.announceLeave()
+
 	for _, ca := range a.peers.connAddrs() {
 		if ca.Conn != nil {
-			(*ca.Conn).CloseWithError(0, "shutdown")
+			ca.Conn.CloseWithError(0, "shutdown")
 		}
 	}
 
@@ -506,6 +561,47 @@ func (a *Alan) Stop() error {
 	}
 
 	return nil
+}
+
+// announceLeave broadcasts a graceful leave message to every peer with a
+// live connection and waits (bounded) for the writes to flush. This is a
+// best-effort operation; failures are silently ignored because the QUIC
+// idle-timeout fallback still applies on the receiver side.
+func (a *Alan) announceLeave() {
+	conns := a.peers.connAddrs()
+	if len(conns) == 0 {
+		return
+	}
+
+	timeout := a.config.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, ca := range conns {
+		if ca.Conn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(conn *quic.Conn) {
+			defer wg.Done()
+			stream, err := conn.OpenStreamSync(ctx)
+			if err != nil {
+				return
+			}
+			if dl, ok := ctx.Deadline(); ok {
+				_ = stream.SetWriteDeadline(dl)
+			}
+			_ = writeLeaveFrame(stream)
+			// Close FINs the stream so the receiver's readMsgType returns
+			// promptly with the leave byte.
+			_ = stream.Close()
+		}(ca.Conn)
+	}
+	wg.Wait()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1010,6 +1106,13 @@ func (a *Alan) acceptLoop() error {
 func (a *Alan) handleConnection(conn *quic.Conn, addr *net.UDPAddr) {
 	defer func() {
 		if existed, _ := a.peers.remove(addr); existed {
+			// Synchronously release locks held by the departing peer
+			// (and notify pending acquisitions) before the
+			// peer-event worker would do it asynchronously. This
+			// closes the window in which another survivor could
+			// process a LockRequest while the dead peer still
+			// appears as a holder locally.
+			a.releaseLocksHeldBy(addr)
 			a.notifyPeerLeft(addr)
 			a.removePeerQueue(addr)
 			a.enqueuePeerEvent(peerEventLeave, addr)
@@ -1052,8 +1155,39 @@ func (a *Alan) handleStream(stream *quic.Stream, addr *net.UDPAddr) {
 		a.handleResponseStream(stream, addr)
 	case MsgTypeLockRequest, MsgTypeLockGrant, MsgTypeLockDeny, MsgTypeLockRelease:
 		a.handleLockStream(msgType, stream, addr)
+	case MsgTypeLeave:
+		a.handleLeaveStream(addr)
 	default:
 		// Unknown message type — close the stream silently.
+	}
+}
+
+// handleLeaveStream processes a graceful leave announcement from a peer.
+// It removes the peer from the registry, releases any locks the peer
+// held, notifies pending requests/acquisitions, fires the OnPeerLeave
+// callback (via the ordered peer-event worker), and closes the
+// underlying QUIC connection so the dial/accept goroutine for this peer
+// exits promptly.
+//
+// Lock release happens synchronously here (not just via the
+// peer-event worker) so a subsequent LockRequest from another survivor
+// observes consistent state — without this, a freshly-dead leader could
+// still appear as the holder in the local lock map at the moment a
+// competing peer's LockRequest is processed, causing spurious denies.
+//
+// Idempotent with the deferred cleanup in handleConnection: whichever
+// path runs second sees existed=false and becomes a no-op.
+func (a *Alan) handleLeaveStream(addr *net.UDPAddr) {
+	existed, conn := a.peers.remove(addr)
+	if !existed {
+		return
+	}
+	a.releaseLocksHeldBy(addr)
+	a.notifyPeerLeft(addr)
+	a.removePeerQueue(addr)
+	a.enqueuePeerEvent(peerEventLeave, addr)
+	if conn != nil {
+		conn.CloseWithError(0, "peer-left")
 	}
 }
 
@@ -1353,9 +1487,9 @@ func (a *Alan) peerEventWorker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if event.eventType == peerEventLeave {
-				a.releaseLocksHeldBy(event.addr)
-			}
+			// Lock release on peer-leave happens synchronously at
+			// the point of removal (handleLeaveStream /
+			// handleConnection's defer); no need to repeat it here.
 			a.mu.RLock()
 			var handler PeerHandler
 			if event.eventType == peerEventJoin {
