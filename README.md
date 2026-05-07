@@ -50,9 +50,7 @@ func main() {
         DNSAddr: "my-cluster.local",
         Port:    5000,
     })
-    if err != nil {
-        panic(err)
-    }
+    // err handling omitted for brevity
 
     a.OnPeerJoin(func(addr *net.UDPAddr) {
         fmt.Printf("peer joined: %s\n", addr)
@@ -61,23 +59,21 @@ func main() {
         fmt.Printf("peer left: %s\n", addr)
     })
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
+    // Handle messages of type "" (empty string is a valid type). The handler runs
+    // on a per-peer goroutine, so messages from the same peer are ordered.
     a.Handle("", func(ctx context.Context, msg alan.Message) {
         fmt.Printf("received from %s: %s\n", msg.Addr, msg.Data)
     })
 
+    // Start the discovery system, if ctx is cancelled or a.Stop() is called, the cluster gracefully shuts down and all peers are notified.
     go a.Start(ctx)
 
     // Broadcast.
     a.Send(ctx, "", []byte("Hello everyone!"))
 
-    // Send to a specific peer.
+    // Send to a specific peer, usually you will get the address from msg.Addr in a handler or a.Peers().
     target := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 5000}
     a.SendTo(ctx, target, "", []byte("Hello you!"))
-
-    a.Stop()
 }
 ```
 
@@ -139,9 +135,10 @@ a.HandleStream("blob", func(ctx context.Context, msg alan.Message, body io.Reade
 })
 ```
 
-A given message-type can have **either** a byte handler (`Handle`) or a
-stream handler (`HandleStream`), not both. Registering the second one returns
-`ErrDuplicateHandler`.
+A given message-type maps to exactly one handler. Calling `Handle` or
+`HandleStream` for a type that is already registered overwrites the previous
+handler (last-write-wins, including across kinds — registering a stream
+handler evicts an existing byte handler for the same type, and vice versa).
 
 Stream handlers run on a per-message goroutine; messages from the same peer
 may be processed concurrently. Use `Handle` if you need ordered delivery.
@@ -155,9 +152,6 @@ handle around. Same pattern as `slog.Default` / `slog.SetDefault`.
 ```go
 func main() {
     a, _ := alan.New(alan.Config{DNSAddr: "my-cluster.local", Port: 5000})
-
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
 
     a.Handle("", handleMessage)
     go a.Start(ctx)
@@ -236,8 +230,8 @@ Notes:
 ## Distributed Locking
 
 ```go
-ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-defer cancel()
+// ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+// defer cancel()
 
 if err := a.Lock(ctx, "my-job"); err != nil {
     log.Fatal(err)
@@ -261,7 +255,7 @@ Features:
 
 - **Named locks** — multiple independent locks identified by key
 - **Auto-release** — held locks are released automatically when the holder disconnects
-- **Quorum-aware** — `Lock` waits for quorum before acquiring
+- **Quorum-aware** — `Lock` waits for quorum before acquiring if you configured `Replicas`
 - **Context-driven** — every lock method respects `ctx`
 
 Limitations: distributed lock is **best-effort coordination**, not strong
@@ -269,8 +263,10 @@ consistency.
 
 - During network partitions, multiple peers may believe they hold the lock.
 - No fencing tokens — there's no way to prove ownership to an external system.
-- Startup race: peers starting simultaneously may all acquire the lock before
-  discovering each other. Configure `Replicas` so quorum mitigates this.
+- Startup race: peers starting simultaneously may all acquire the lock
+  before discovering each other. Configure `Replicas` so quorum mitigates
+  this, and see [Avoiding the Startup Race in Kubernetes](#avoiding-the-startup-race-in-kubernetes)
+  for the operational pattern that closes the gap.
 
 ### Leader Election Helpers
 
@@ -661,8 +657,7 @@ var (
     ErrLockNotHeld      // Unlock called for lock not held here
     ErrNoPeerConnection // no live QUIC conn for target
     ErrMessageTooLarge  // bytes-API exceeds MaxMessageSize
-    ErrDuplicateHandler // both Handle and HandleStream for same type
-    ErrTypeTooLong      // message type > 65535 bytes
+    ErrTypeTooLong      // message type > 65535 bytes (Handle / HandleStream panic with this)
     ErrFrameTooLarge    // wire frame announced > MaxMessageSize
     ErrNoDefault        // global Default() with none set
 )
@@ -709,6 +704,250 @@ net.core.wmem_max=7500000
 
 This is optional — the application works without it, but may drop packets
 under heavy load.
+
+## Avoiding the Startup Race in Kubernetes
+
+Alan's locks rely on peer discovery to serialize acquisitions. If N pods
+boot at the same instant — before they discover each other via DNS —
+each may self-grant the same lock. The fix is operational: bring pods up
+one at a time so each new pod discovers existing peers before its first
+`Lock` call.
+
+Use a `Deployment` with a single-pod rolling update:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Roll one pod at a time; quorum is preserved (2/3 stay up).
+      # maxSurge: 0 prevents a new pod from booting before the old one
+      # is gone, so the new pod always joins an existing cluster instead
+      # of self-granting locks.
+      maxSurge: 0
+      maxUnavailable: 1
+```
+
+For initial bring-up, deploy with `replicas: 1` first, wait for it to
+become Ready, then scale up: `kubectl scale deploy/foo --replicas=3`.
+Each later pod discovers the existing peers via DNS before its first
+`Lock` call.
+
+Or use a `StatefulSet`, which handles initial bring-up natively:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  replicas: 3
+  # OrderedReady ensures pod-0 is up and Ready before pod-1 starts.
+  # With a 3-node quorum this avoids split-brain during initial bring-up.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Roll one pod at a time; quorum is preserved (2/3 stay up).
+      partition: 0
+```
+
+Avoid: `podManagementPolicy: Parallel`, one-shot scale from 0 to N,
+`kubectl rollout restart` with `maxSurge > 0`, and `kubectl delete pod`
+against all replicas at once.
+
+## FAQ
+
+<details>
+<summary><b>Why QUIC and not TCP?</b></summary>
+
+TCP gives you a reliable byte stream and nothing else — every cluster on
+top still has to layer TLS, framing, multiplexing, and keep-alive logic.
+QUIC delivers all of that as a single transport:
+
+- **TLS 1.3 is mandatory and built in.** No "plaintext mode", no separate
+  handshake protocol to design. Every packet is AEAD-encrypted from the
+  first flight onward.
+- **Native multiplexing without head-of-line blocking.** A lost packet on
+  one stream does not stall others. With TCP, a single dropped segment
+  blocks every logical message sharing the connection.
+- **Faster connection setup.** 1-RTT handshakes (0-RTT for resumption) vs.
+  TCP+TLS's typical 2-3 RTTs. Cluster join latency stays low.
+- **Connection-level keep-alive and idle timeout out of the box.** Alan
+  uses `KeepAlivePeriod` and `MaxIdleTimeout` directly; with TCP you'd
+  reinvent both at the application layer.
+- **Connection migration.** A peer can change IP (e.g. NAT rebinding,
+  short network blip) without dropping the QUIC session.
+- **One UDP socket for the whole cluster.** Alan binds a single
+  `net.PacketConn` and lets `quic.Transport` demux every peer onto it.
+  No per-peer file descriptors.
+
+The cost: UDP buffer tuning on Linux (see "UDP Buffer Size" above) and a
+slightly less universal toolchain. For a peer-to-peer library that must
+encrypt, frame, and multiplex anyway, those are easy trade-offs.
+
+</details>
+
+<details>
+<summary><b>If we hold a persistent QUIC connection, isn't it the same as TCP?</b></summary>
+
+A persistent QUIC connection still differs from a persistent TCP
+connection in ways that matter for cluster traffic:
+
+- **Independent streams.** Even on a single long-lived QUIC session, each
+  message uses its own stream. Streams are independently flow-controlled
+  and independently FIN-able. A slow `Handle` for one type cannot stall
+  delivery of another type from the same peer. With TCP you'd need to
+  multiplex inside your own protocol and reimplement per-stream
+  backpressure.
+- **No head-of-line blocking from packet loss.** TCP guarantees in-order
+  delivery across the *whole* connection — a lost segment delays every
+  byte after it, even if those bytes belong to unrelated logical
+  messages. QUIC's loss recovery is per-stream.
+- **Encryption is not optional.** A persistent TCP connection can be
+  cleartext; a QUIC session is always TLS 1.3 with forward secrecy.
+- **Built-in liveness signal.** QUIC's keep-alive + `MaxIdleTimeout` give
+  alan an authoritative "is this peer alive?" signal. TCP keep-alive is
+  OS-tunable, often disabled, and granular in minutes — not seconds.
+- **Connection migration.** A QUIC session survives an IP change; a TCP
+  connection does not.
+
+So yes, a persistent QUIC connection plays the same *role* as a
+persistent TCP connection — but it bundles framing, multiplexing,
+encryption, and liveness that you would otherwise build yourself.
+
+</details>
+
+<details>
+<summary><b>Why FIN-delimited <code>Data</code> frames instead of length-prefixed?</b></summary>
+
+`Data` frames carry streaming payloads of unknown size — think file
+transfers, log shipping, or anything wrapped by `SendStream`. Forcing the
+sender to know the total length up-front would either require buffering
+the whole payload (defeating the streaming API) or sending an inaccurate
+length.
+
+QUIC streams are bidirectional with explicit FIN signalling. Alan uses
+that directly: the body runs until FIN, the receiver delivers it as an
+`io.Reader`, and neither side has to materialize the payload in memory.
+
+`Request` / `Response` frames *are* length-prefixed (varint), because
+they're bounded by `MaxMessageSize` and the receiver must enforce that
+cap before allocating. The two encodings serve different goals.
+
+</details>
+
+<details>
+<summary><b>Why mTLS with self-signed certs instead of a CA?</b></summary>
+
+A CA is useful when "identity" means a DNS name and you need a third
+party to vouch for it. In a cluster, identity means "member of *this*
+cluster", and the trust anchor is the pre-shared key (when enabled), not
+a CA.
+
+Each peer generates an ephemeral ECDSA P-256 cert in memory at startup
+and embeds the SHA-256 fingerprint of the PSK in `Subject.Organization`.
+The TLS `VerifyPeerCertificate` callback compares fingerprints with a
+constant-time check on every handshake. Benefits:
+
+- Nothing on disk to leak or rotate.
+- No CA infrastructure to operate.
+- Rotating the PSK rotates effective trust across the whole cluster.
+
+See the "How mTLS and self-signed certs are safe here" section for the
+full threat model.
+
+</details>
+
+<details>
+<summary><b>What happens to in-flight messages when a peer disconnects?</b></summary>
+
+- **Byte sends** (`Send` / `SendTo`) record the disconnect in the
+  returned `SendResult.Error` (or surface it via the call's error if
+  it's a single-target send). The library does not retry — it's
+  best-effort delivery, the application decides whether to retry.
+- **Streaming sends** return whatever bytes were acknowledged by QUIC
+  before the connection died, plus the error.
+- **`SendAndWaitReply`** drops the disconnected peer from the expected
+  set and returns when remaining peers respond.
+- **`SendToAndWaitReply`** returns `ErrPeerDisconnected` immediately.
+- **Locks held by the disconnecting peer** are released cluster-wide
+  when its QUIC session closes (graceful Stop or `MaxIdleTimeout`).
+
+</details>
+
+<details>
+<summary><b>Is alan a Raft / Paxos replacement?</b></summary>
+
+No. Alan is a discovery + transport + best-effort coordination library.
+It does not implement a consensus protocol, so:
+
+- Distributed locks are best-effort, not strongly consistent. During a
+  partition, both sides may believe they hold a lock.
+- There is no replicated log, no fencing tokens, no commit index.
+- Quorum (`Replicas`) reduces the chance of split-brain at startup but
+  does not prevent it across partitions.
+
+**Good enough for replicated services?** Yes, for the common cases:
+leader-elected cron, "only one worker indexes the catalog", singleton
+schedulers, idempotent jobs, and any work where occasional double-execution
+is recoverable. Combined with `Replicas` set correctly and the StatefulSet
+deployment pattern above, the practical risk is low on a healthy network.
+
+**Not good enough when:** external effects must not double-execute (payments,
+non-idempotent writes), state must survive restart and agree across nodes,
+or you need linearizable reads. Use an actual consensus system
+(etcd / Consul / a Raft library) for that and let alan handle the messaging
+layer around it.
+
+</details>
+
+<details>
+<summary><b>Why isn't there a "lock lost" notification?</b></summary>
+
+Locks have no TTL or session — the holder keeps a lock until it calls
+`Unlock`, exits gracefully, or its QUIC session hits `MaxIdleTimeout`.
+While it holds the lock, the lock is held; there is no "your lock was
+revoked" path. This keeps the protocol simple and avoids a class of
+bugs where a leader keeps acting after losing leadership.
+
+If you need that, derive a context inside your `RunAsLeader` callback
+and cancel it from your own logic (e.g. external health check).
+
+</details>
+
+<details>
+<summary><b>Can I use alan over the public internet?</b></summary>
+
+Technically yes — QUIC/TLS 1.3 with PSK admission is solid encryption
+and authentication. Practically, alan is designed for cluster-internal
+use:
+
+- DNS-based discovery assumes peers can resolve each other.
+- Per-peer byte budget defaults (256 MiB) assume a trusted/bounded peer
+  set.
+- Distributed locks are best-effort and assume low partition rates.
+
+For internet-exposed services, prefer a dedicated cluster network
+(VPC, overlay, WireGuard) and reserve alan for in-cluster traffic.
+
+</details>
+
+<details>
+<summary><b>Why does <code>Handle</code> panic on oversized type strings?</b></summary>
+
+Message type strings are typically static literals (`"data"`,
+`"metrics-v2"`, etc.). A type longer than `MaxTypeLen` (65 535 bytes,
+the uint16 wire limit) is a programmer error, not a runtime condition
+worth recovering from. Panicking matches Go conventions for misuse —
+similar to `regexp.MustCompile` failing on a bad pattern at startup.
+
+The duplicate-handler case is handled by overwriting (last-write-wins)
+rather than erroring, so `Handle` and `HandleStream` no longer return
+an error.
+
+</details>
 
 ## License
 

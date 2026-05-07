@@ -1212,22 +1212,42 @@ func TestSendCtxCancelOnIdlePeer(t *testing.T) {
 	}
 }
 
-func TestDuplicateHandlerRejected(t *testing.T) {
+func TestHandlerOverwrite(t *testing.T) {
 	a, _ := New(Config{Port: 5000})
 
-	if err := a.Handle("foo", func(ctx context.Context, msg Message) {}); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if err := a.HandleStream("foo", func(ctx context.Context, msg Message, body io.Reader) error { return nil }); !errors.Is(err, ErrDuplicateHandler) {
-		t.Errorf("expected ErrDuplicateHandler, got %v", err)
+	// Register a byte handler, then a stream handler for the same type.
+	// The stream handler should replace the byte handler.
+	a.Handle("foo", func(ctx context.Context, msg Message) {})
+	a.handlersMu.RLock()
+	_, hasByte := a.byteHandlers["foo"]
+	a.handlersMu.RUnlock()
+	if !hasByte {
+		t.Fatalf("expected byte handler registered")
 	}
 
-	a.Remove("foo")
-	if err := a.HandleStream("foo", func(ctx context.Context, msg Message, body io.Reader) error { return nil }); err != nil {
-		t.Fatalf("HandleStream after Remove: %v", err)
+	a.HandleStream("foo", func(ctx context.Context, msg Message, body io.Reader) error { return nil })
+	a.handlersMu.RLock()
+	_, hasByte = a.byteHandlers["foo"]
+	_, hasStream := a.streamHandlers["foo"]
+	a.handlersMu.RUnlock()
+	if hasByte {
+		t.Errorf("expected byte handler evicted by HandleStream")
 	}
-	if err := a.Handle("foo", func(ctx context.Context, msg Message) {}); !errors.Is(err, ErrDuplicateHandler) {
-		t.Errorf("expected ErrDuplicateHandler, got %v", err)
+	if !hasStream {
+		t.Errorf("expected stream handler registered")
+	}
+
+	// Reverse: Handle should evict the stream handler.
+	a.Handle("foo", func(ctx context.Context, msg Message) {})
+	a.handlersMu.RLock()
+	_, hasByte = a.byteHandlers["foo"]
+	_, hasStream = a.streamHandlers["foo"]
+	a.handlersMu.RUnlock()
+	if !hasByte {
+		t.Errorf("expected byte handler registered")
+	}
+	if hasStream {
+		t.Errorf("expected stream handler evicted by Handle")
 	}
 }
 

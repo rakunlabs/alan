@@ -41,9 +41,6 @@ var (
 	ErrNoPeerConnection = errors.New("alan: no QUIC connection to peer")
 	// ErrMessageTooLarge is returned when a bytes-API message exceeds Config.MaxMessageSize.
 	ErrMessageTooLarge = errors.New("alan: message exceeds MaxMessageSize")
-	// ErrDuplicateHandler is returned when both Handle and HandleStream are
-	// registered for the same message type.
-	ErrDuplicateHandler = errors.New("alan: handler already registered for type")
 	// ErrTypeTooLong is returned when a message type exceeds 65535 bytes.
 	ErrTypeTooLong = errors.New("alan: message type exceeds maximum length (65535 bytes)")
 )
@@ -365,19 +362,19 @@ func (a *Alan) OnPeerLeave(handler PeerHandler) {
 // message body is read (capped by Config.MaxMessageSize) before the handler
 // is invoked. Use "" for a catch-all handler.
 //
-// Returns ErrDuplicateHandler if a stream handler is already registered for
-// the same type.
-func (a *Alan) Handle(msgType string, handler MessageHandler) error {
+// Panics with ErrTypeTooLong if msgType exceeds MaxTypeLen; this is treated as
+// a programmer error since type strings are typically static.
+//
+// If a handler (byte or stream) is already registered for msgType, it is
+// replaced. A type maps to exactly one handler at any time.
+func (a *Alan) Handle(msgType string, handler MessageHandler) {
 	if len(msgType) > MaxTypeLen {
-		return ErrTypeTooLong
+		panic(ErrTypeTooLong)
 	}
 	a.handlersMu.Lock()
 	defer a.handlersMu.Unlock()
-	if _, exists := a.streamHandlers[msgType]; exists {
-		return ErrDuplicateHandler
-	}
+	delete(a.streamHandlers, msgType)
 	a.byteHandlers[msgType] = handler
-	return nil
 }
 
 // HandleStream registers a streaming handler for the given message type. The
@@ -389,19 +386,19 @@ func (a *Alan) Handle(msgType string, handler MessageHandler) error {
 // Stream handlers run on per-message goroutines; messages from the same peer
 // may be processed concurrently. Use Handle if you need ordered delivery.
 //
-// Returns ErrDuplicateHandler if a byte handler is already registered for the
-// same type.
-func (a *Alan) HandleStream(msgType string, handler StreamHandler) error {
+// Panics with ErrTypeTooLong if msgType exceeds MaxTypeLen; this is treated as
+// a programmer error since type strings are typically static.
+//
+// If a handler (byte or stream) is already registered for msgType, it is
+// replaced. A type maps to exactly one handler at any time.
+func (a *Alan) HandleStream(msgType string, handler StreamHandler) {
 	if len(msgType) > MaxTypeLen {
-		return ErrTypeTooLong
+		panic(ErrTypeTooLong)
 	}
 	a.handlersMu.Lock()
 	defer a.handlersMu.Unlock()
-	if _, exists := a.byteHandlers[msgType]; exists {
-		return ErrDuplicateHandler
-	}
+	delete(a.byteHandlers, msgType)
 	a.streamHandlers[msgType] = handler
-	return nil
 }
 
 // Remove unregisters any handler (byte or stream) for the given type.
