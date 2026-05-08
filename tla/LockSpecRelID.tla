@@ -1,0 +1,426 @@
+----------------------------- MODULE LockSpecRelID ----------------------------
+(***************************************************************************)
+(* Variant: keep the unordered network bag (one stream per message), but   *)
+(* tag every Release with the requestID that established the HeldBy entry *)
+(* it intends to clear. Receiver drops Releases whose id does not match.  *)
+(*                                                                         *)
+(* Question this checks: is the requestID-tagged Release alone enough,    *)
+(* even WITHOUT FIFO per-peer ordering?                                    *)
+(***************************************************************************)
+EXTENDS Naturals, FiniteSets, TLC
+
+CONSTANTS
+    Peers,
+    MaxAttempts,
+    RequireQuorum,
+    EnableDisconnect
+
+ASSUME RequireQuorum    \in BOOLEAN
+ASSUME EnableDisconnect \in BOOLEAN
+ASSUME MaxAttempts \in Nat /\ MaxAttempts >= 1
+
+QuorumSize == (Cardinality(Peers) \div 2) + 1
+
+StateFree      == [tag |-> "Free"]
+StatePending   == [tag |-> "Pending"]
+StateSelfHeld  == [tag |-> "SelfHeld"]
+StateHeldBy(q) == [tag |-> "HeldBy", who |-> q]
+
+ReqID(p, n) == [peer |-> p, num |-> n]
+NoReq       == [peer |-> 0, num |-> 0]
+
+PeerIdx == CHOOSE f \in [Peers -> 1..Cardinality(Peers)] :
+              \A p, q \in Peers : p # q => f[p] # f[q]
+
+ReqLT(a, b) == \/ PeerIdx[a.peer] < PeerIdx[b.peer]
+               \/ /\ a.peer = b.peer
+                  /\ a.num  < b.num
+
+MsgRequest(f, t, id) == [type |-> "Req",   from |-> f, to |-> t, id |-> id]
+MsgGrant(f, t, id)   == [type |-> "Grant", from |-> f, to |-> t, id |-> id]
+MsgDeny(f, t, id)    == [type |-> "Deny",  from |-> f, to |-> t, id |-> id]
+\* CHANGED: Release now carries an id.
+MsgRelease(f, t, id) == [type |-> "Rel",   from |-> f, to |-> t, id |-> id]
+
+(*--algorithm LockRelID
+
+variables
+    state    = [p \in Peers |-> StateFree],
+    myReq    = [p \in Peers |-> NoReq],
+    grants   = [p \in Peers |-> {}],
+    expected = [p \in Peers |-> {}],
+    visible  = [p \in Peers |-> {}],
+    attempts = [p \in Peers |-> 0],
+    severed  = {},
+    \* Tracks the requestID that established the current HeldBy entry,
+    \* so we can ignore stale Releases.
+    heldByID = [p \in Peers |-> NoReq],
+    network  = {};
+
+define
+    HasQuorum(p) == (~RequireQuorum)
+                  \/ ((Cardinality(visible[p]) + 1) >= QuorumSize)
+
+    Holders         == { p \in Peers : state[p] = StateSelfHeld }
+    MutualExclusion == Cardinality(Holders) <= 1
+
+    TypeInv ==
+        /\ visible  \in [Peers -> SUBSET Peers]
+        /\ attempts \in [Peers -> 0..MaxAttempts]
+        /\ \A p \in Peers :
+              \/ state[p] = StateFree
+              \/ state[p] = StatePending
+              \/ state[p] = StateSelfHeld
+              \/ /\ state[p].tag = "HeldBy"
+                 /\ state[p].who \in Peers
+end define;
+
+process Peer \in Peers
+begin Loop:
+    while TRUE do
+        either
+            await visible[self] # (Peers \ {self});
+            with q \in (Peers \ {self}) \ visible[self] do
+                await {self, q} \notin severed;
+                visible[self] := visible[self] \cup {q} ||
+                visible[q]    := visible[q]    \cup {self};
+            end with;
+
+        or
+            await /\ state[self]   = StateFree
+                  /\ visible[self] = {}
+                  /\ attempts[self] < MaxAttempts
+                  /\ HasQuorum(self);
+            attempts[self] := attempts[self] + 1 ||
+            state[self]    := StateSelfHeld;
+
+        or
+            await /\ state[self]   = StateFree
+                  /\ visible[self] # {}
+                  /\ attempts[self] < MaxAttempts
+                  /\ HasQuorum(self);
+            with newAttempt = attempts[self] + 1,
+                 rid        = ReqID(self, newAttempt) do
+                attempts[self] := newAttempt ||
+                state[self]    := StatePending ||
+                myReq[self]    := rid ||
+                grants[self]   := {} ||
+                expected[self] := visible[self] ||
+                network        := network
+                                \cup { MsgRequest(self, q, rid) :
+                                       q \in visible[self] };
+            end with;
+
+        or
+            with m \in { x \in network : x.type = "Req" /\ x.to = self } do
+                if state[self] = StateFree then
+                    state[self]    := StateHeldBy(m.from) ||
+                    heldByID[self] := m.id ||
+                    network        := (network \ {m})
+                                    \cup { MsgGrant(self, m.from, m.id) };
+                elsif state[self].tag = "HeldBy" \/ state[self] = StateSelfHeld then
+                    network := (network \ {m})
+                             \cup { MsgDeny(self, m.from, m.id) };
+                elsif state[self] = StatePending then
+                    if ReqLT(m.id, myReq[self]) then
+                        with myOldReq = myReq[self] do
+                            state[self]    := StateHeldBy(m.from) ||
+                            heldByID[self] := m.id ||
+                            myReq[self]    := NoReq ||
+                            grants[self]   := {} ||
+                            expected[self] := {} ||
+                            network := (network \ {m})
+                                     \cup { MsgGrant(self, m.from, m.id) }
+                                     \cup { MsgRelease(self, q, myOldReq) :
+                                            q \in visible[self] };
+                        end with;
+                    else
+                        network := (network \ {m})
+                                 \cup { MsgDeny(self, m.from, m.id) };
+                    end if;
+                end if;
+            end with;
+
+        or
+            with m \in { x \in network :
+                            /\ x.type = "Grant"
+                            /\ x.to   = self
+                            /\ state[self] = StatePending
+                            /\ x.id   = myReq[self] } do
+                if expected[self] \subseteq (grants[self] \cup {m.from}) then
+                    state[self]    := StateSelfHeld ||
+                    myReq[self]    := NoReq ||
+                    grants[self]   := {} ||
+                    expected[self] := {} ||
+                    network        := network \ {m};
+                else
+                    grants[self] := grants[self] \cup {m.from} ||
+                    network      := network \ {m};
+                end if;
+            end with;
+
+        or
+            with m \in { x \in network :
+                            /\ x.type = "Deny"
+                            /\ x.to   = self
+                            /\ state[self] = StatePending
+                            /\ x.id   = myReq[self] } do
+                with myOldReq = myReq[self] do
+                    state[self]    := StateFree ||
+                    myReq[self]    := NoReq ||
+                    grants[self]   := {} ||
+                    expected[self] := {} ||
+                    network        := (network \ {m})
+                                    \cup { MsgRelease(self, q, myOldReq) :
+                                           q \in visible[self] };
+                end with;
+            end with;
+
+        or
+            (* Drop stale Grant/Deny that no longer match myReq. *)
+            with m \in { x \in network :
+                            /\ x.to = self
+                            /\ x.type \in {"Grant", "Deny"}
+                            /\ \/ state[self] # StatePending
+                               \/ x.id # myReq[self] } do
+                network := network \ {m};
+            end with;
+
+        or
+            (* CHANGED: Release matches only if id == heldByID[self]. *)
+            with m \in { x \in network : x.type = "Rel" /\ x.to = self } do
+                if /\ state[self].tag = "HeldBy"
+                   /\ state[self].who = m.from
+                   /\ heldByID[self]  = m.id then
+                    state[self]    := StateFree ||
+                    heldByID[self] := NoReq ||
+                    network        := network \ {m};
+                else
+                    network := network \ {m};
+                end if;
+            end with;
+
+        or
+            await EnableDisconnect /\ visible[self] # {};
+            with q \in visible[self] do
+                visible[self] := visible[self] \ {q} ||
+                visible[q]    := visible[q]    \ {self} ||
+                severed       := severed \cup { {self, q} } ||
+
+                state[self]    := IF state[self].tag = "HeldBy"
+                                    /\ state[self].who = q
+                                  THEN StateFree
+                                  ELSE state[self] ||
+                state[q]       := IF state[q].tag = "HeldBy"
+                                    /\ state[q].who = self
+                                  THEN StateFree
+                                  ELSE state[q] ||
+                heldByID[self] := IF state[self].tag = "HeldBy"
+                                    /\ state[self].who = q
+                                  THEN NoReq
+                                  ELSE heldByID[self] ||
+                heldByID[q]    := IF state[q].tag = "HeldBy"
+                                    /\ state[q].who = self
+                                  THEN NoReq
+                                  ELSE heldByID[q] ||
+
+                expected[self] := IF state[self] = StatePending
+                                  THEN expected[self] \ {q}
+                                  ELSE expected[self] ||
+                expected[q]    := IF state[q] = StatePending
+                                  THEN expected[q] \ {self}
+                                  ELSE expected[q];
+            end with;
+        end either;
+    end while;
+end process;
+
+end algorithm; *)
+\* BEGIN TRANSLATION (chksum(pcal) = "564674a4" /\ chksum(tla) = "8fe0fb6e")
+VARIABLES state, myReq, grants, expected, visible, attempts, severed, 
+          heldByID, network
+
+(* define statement *)
+HasQuorum(p) == (~RequireQuorum)
+              \/ ((Cardinality(visible[p]) + 1) >= QuorumSize)
+
+Holders         == { p \in Peers : state[p] = StateSelfHeld }
+MutualExclusion == Cardinality(Holders) <= 1
+
+TypeInv ==
+    /\ visible  \in [Peers -> SUBSET Peers]
+    /\ attempts \in [Peers -> 0..MaxAttempts]
+    /\ \A p \in Peers :
+          \/ state[p] = StateFree
+          \/ state[p] = StatePending
+          \/ state[p] = StateSelfHeld
+          \/ /\ state[p].tag = "HeldBy"
+             /\ state[p].who \in Peers
+
+
+vars == << state, myReq, grants, expected, visible, attempts, severed, 
+           heldByID, network >>
+
+ProcSet == (Peers)
+
+Init == (* Global variables *)
+        /\ state = [p \in Peers |-> StateFree]
+        /\ myReq = [p \in Peers |-> NoReq]
+        /\ grants = [p \in Peers |-> {}]
+        /\ expected = [p \in Peers |-> {}]
+        /\ visible = [p \in Peers |-> {}]
+        /\ attempts = [p \in Peers |-> 0]
+        /\ severed = {}
+        /\ heldByID = [p \in Peers |-> NoReq]
+        /\ network = {}
+
+Peer(self) == \/ /\ visible[self] # (Peers \ {self})
+                 /\ \E q \in (Peers \ {self}) \ visible[self]:
+                      /\ {self, q} \notin severed
+                      /\ visible' = [visible EXCEPT ![self] = visible[self] \cup {q},
+                                                    ![q] = visible[q]    \cup {self}]
+                 /\ UNCHANGED <<state, myReq, grants, expected, attempts, severed, heldByID, network>>
+              \/ /\ /\ state[self]   = StateFree
+                    /\ visible[self] = {}
+                    /\ attempts[self] < MaxAttempts
+                    /\ HasQuorum(self)
+                 /\ /\ attempts' = [attempts EXCEPT ![self] = attempts[self] + 1]
+                    /\ state' = [state EXCEPT ![self] = StateSelfHeld]
+                 /\ UNCHANGED <<myReq, grants, expected, visible, severed, heldByID, network>>
+              \/ /\ /\ state[self]   = StateFree
+                    /\ visible[self] # {}
+                    /\ attempts[self] < MaxAttempts
+                    /\ HasQuorum(self)
+                 /\ LET newAttempt == attempts[self] + 1 IN
+                      LET rid == ReqID(self, newAttempt) IN
+                        /\ attempts' = [attempts EXCEPT ![self] = newAttempt]
+                        /\ expected' = [expected EXCEPT ![self] = visible[self]]
+                        /\ grants' = [grants EXCEPT ![self] = {}]
+                        /\ myReq' = [myReq EXCEPT ![self] = rid]
+                        /\ network' =   network
+                                      \cup { MsgRequest(self, q, rid) :
+                                             q \in visible[self] }
+                        /\ state' = [state EXCEPT ![self] = StatePending]
+                 /\ UNCHANGED <<visible, severed, heldByID>>
+              \/ /\ \E m \in { x \in network : x.type = "Req" /\ x.to = self }:
+                      IF state[self] = StateFree
+                         THEN /\ /\ heldByID' = [heldByID EXCEPT ![self] = m.id]
+                                 /\ network' =   (network \ {m})
+                                               \cup { MsgGrant(self, m.from, m.id) }
+                                 /\ state' = [state EXCEPT ![self] = StateHeldBy(m.from)]
+                              /\ UNCHANGED << myReq, grants, expected >>
+                         ELSE /\ IF state[self].tag = "HeldBy" \/ state[self] = StateSelfHeld
+                                    THEN /\ network' =   (network \ {m})
+                                                       \cup { MsgDeny(self, m.from, m.id) }
+                                         /\ UNCHANGED << state, myReq, 
+                                                         grants, expected, 
+                                                         heldByID >>
+                                    ELSE /\ IF state[self] = StatePending
+                                               THEN /\ IF ReqLT(m.id, myReq[self])
+                                                          THEN /\ LET myOldReq == myReq[self] IN
+                                                                    /\ expected' = [expected EXCEPT ![self] = {}]
+                                                                    /\ grants' = [grants EXCEPT ![self] = {}]
+                                                                    /\ heldByID' = [heldByID EXCEPT ![self] = m.id]
+                                                                    /\ myReq' = [myReq EXCEPT ![self] = NoReq]
+                                                                    /\ network' =   (network \ {m})
+                                                                                  \cup { MsgGrant(self, m.from, m.id) }
+                                                                                  \cup { MsgRelease(self, q, myOldReq) :
+                                                                                         q \in visible[self] }
+                                                                    /\ state' = [state EXCEPT ![self] = StateHeldBy(m.from)]
+                                                          ELSE /\ network' =   (network \ {m})
+                                                                             \cup { MsgDeny(self, m.from, m.id) }
+                                                               /\ UNCHANGED << state, 
+                                                                               myReq, 
+                                                                               grants, 
+                                                                               expected, 
+                                                                               heldByID >>
+                                               ELSE /\ TRUE
+                                                    /\ UNCHANGED << state, 
+                                                                    myReq, 
+                                                                    grants, 
+                                                                    expected, 
+                                                                    heldByID, 
+                                                                    network >>
+                 /\ UNCHANGED <<visible, attempts, severed>>
+              \/ /\ \E m \in { x \in network :
+                                  /\ x.type = "Grant"
+                                  /\ x.to   = self
+                                  /\ state[self] = StatePending
+                                  /\ x.id   = myReq[self] }:
+                      IF expected[self] \subseteq (grants[self] \cup {m.from})
+                         THEN /\ /\ expected' = [expected EXCEPT ![self] = {}]
+                                 /\ grants' = [grants EXCEPT ![self] = {}]
+                                 /\ myReq' = [myReq EXCEPT ![self] = NoReq]
+                                 /\ network' = network \ {m}
+                                 /\ state' = [state EXCEPT ![self] = StateSelfHeld]
+                         ELSE /\ /\ grants' = [grants EXCEPT ![self] = grants[self] \cup {m.from}]
+                                 /\ network' = network \ {m}
+                              /\ UNCHANGED << state, myReq, expected >>
+                 /\ UNCHANGED <<visible, attempts, severed, heldByID>>
+              \/ /\ \E m \in { x \in network :
+                                  /\ x.type = "Deny"
+                                  /\ x.to   = self
+                                  /\ state[self] = StatePending
+                                  /\ x.id   = myReq[self] }:
+                      LET myOldReq == myReq[self] IN
+                        /\ expected' = [expected EXCEPT ![self] = {}]
+                        /\ grants' = [grants EXCEPT ![self] = {}]
+                        /\ myReq' = [myReq EXCEPT ![self] = NoReq]
+                        /\ network' =   (network \ {m})
+                                      \cup { MsgRelease(self, q, myOldReq) :
+                                             q \in visible[self] }
+                        /\ state' = [state EXCEPT ![self] = StateFree]
+                 /\ UNCHANGED <<visible, attempts, severed, heldByID>>
+              \/ /\ \E m \in { x \in network :
+                                  /\ x.to = self
+                                  /\ x.type \in {"Grant", "Deny"}
+                                  /\ \/ state[self] # StatePending
+                                     \/ x.id # myReq[self] }:
+                      network' = network \ {m}
+                 /\ UNCHANGED <<state, myReq, grants, expected, visible, attempts, severed, heldByID>>
+              \/ /\ \E m \in { x \in network : x.type = "Rel" /\ x.to = self }:
+                      IF /\ state[self].tag = "HeldBy"
+                         /\ state[self].who = m.from
+                         /\ heldByID[self]  = m.id
+                         THEN /\ /\ heldByID' = [heldByID EXCEPT ![self] = NoReq]
+                                 /\ network' = network \ {m}
+                                 /\ state' = [state EXCEPT ![self] = StateFree]
+                         ELSE /\ network' = network \ {m}
+                              /\ UNCHANGED << state, heldByID >>
+                 /\ UNCHANGED <<myReq, grants, expected, visible, attempts, severed>>
+              \/ /\ EnableDisconnect /\ visible[self] # {}
+                 /\ \E q \in visible[self]:
+                      /\ expected' = [expected EXCEPT ![self] = IF state[self] = StatePending
+                                                                THEN expected[self] \ {q}
+                                                                ELSE expected[self],
+                                                      ![q] = IF state[q] = StatePending
+                                                             THEN expected[q] \ {self}
+                                                             ELSE expected[q]]
+                      /\ heldByID' = [heldByID EXCEPT ![self] = IF state[self].tag = "HeldBy"
+                                                                  /\ state[self].who = q
+                                                                THEN NoReq
+                                                                ELSE heldByID[self],
+                                                      ![q] = IF state[q].tag = "HeldBy"
+                                                               /\ state[q].who = self
+                                                             THEN NoReq
+                                                             ELSE heldByID[q]]
+                      /\ severed' = (severed \cup { {self, q} })
+                      /\ state' = [state EXCEPT ![self] = IF state[self].tag = "HeldBy"
+                                                            /\ state[self].who = q
+                                                          THEN StateFree
+                                                          ELSE state[self],
+                                                ![q] = IF state[q].tag = "HeldBy"
+                                                         /\ state[q].who = self
+                                                       THEN StateFree
+                                                       ELSE state[q]]
+                      /\ visible' = [visible EXCEPT ![self] = visible[self] \ {q},
+                                                    ![q] = visible[q]    \ {self}]
+                 /\ UNCHANGED <<myReq, grants, attempts, network>>
+
+Next == (\E self \in Peers: Peer(self))
+
+Spec == Init /\ [][Next]_vars
+
+\* END TRANSLATION 
+
+=============================================================================

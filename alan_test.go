@@ -97,10 +97,12 @@ func TestNew(t *testing.T) {
 
 func TestProtocolEncoding(t *testing.T) {
 	t.Run("data header roundtrip", func(t *testing.T) {
-		// writeDataHeader writes [MsgTypeData][TypeLen][Type]; on the read side
-		// the MsgType byte is consumed first by readMsgType.
+		// writeDataHeader writes [MsgTypeData][Epoch:8][Seq:8][TypeLen][Type];
+		// on the read side the MsgType byte is consumed first by readMsgType.
 		var buf bytes.Buffer
-		if err := writeDataHeader(&buf, "my.type"); err != nil {
+		const wantEpoch = uint64(0xCAFEBABEDEADBEEF)
+		const wantSeq = uint64(0xDEADBEEF)
+		if err := writeDataHeader(&buf, wantEpoch, wantSeq, "my.type"); err != nil {
 			t.Fatalf("writeDataHeader: %v", err)
 		}
 		if _, err := buf.WriteString("payload"); err != nil {
@@ -114,9 +116,15 @@ func TestProtocolEncoding(t *testing.T) {
 		if got != MsgTypeData {
 			t.Errorf("type byte = %x, want %x", got, MsgTypeData)
 		}
-		mt, err := readDataHeader(&buf)
+		gotEpoch, gotSeq, mt, err := readDataHeader(&buf)
 		if err != nil {
 			t.Fatalf("readDataHeader: %v", err)
+		}
+		if gotEpoch != wantEpoch {
+			t.Errorf("epoch = %x, want %x", gotEpoch, wantEpoch)
+		}
+		if gotSeq != wantSeq {
+			t.Errorf("seq = %d, want %d", gotSeq, wantSeq)
 		}
 		if mt != "my.type" {
 			t.Errorf("type = %q, want %q", mt, "my.type")
@@ -133,7 +141,9 @@ func TestProtocolEncoding(t *testing.T) {
 	t.Run("request frame roundtrip", func(t *testing.T) {
 		var buf bytes.Buffer
 		reqID := bytes.Repeat([]byte{0xAB}, RequestIDSize)
-		if err := writeRequestFrame(&buf, reqID, "rpc.echo", []byte("hello")); err != nil {
+		const wantEpoch = uint64(0x1111_2222_3333_4444)
+		const wantSeq = uint64(42)
+		if err := writeRequestFrame(&buf, wantEpoch, wantSeq, reqID, "rpc.echo", []byte("hello")); err != nil {
 			t.Fatalf("writeRequestFrame: %v", err)
 		}
 		mt, err := readMsgType(&buf)
@@ -143,9 +153,15 @@ func TestProtocolEncoding(t *testing.T) {
 		if mt != MsgTypeRequest {
 			t.Errorf("msgType = %x, want %x", mt, MsgTypeRequest)
 		}
-		gotID, gotType, gotBody, err := readRequestFrame(&buf, 1024)
+		gotEpoch, gotSeq, gotID, gotType, gotBody, err := readRequestFrame(&buf, 1024)
 		if err != nil {
 			t.Fatalf("readRequestFrame: %v", err)
+		}
+		if gotEpoch != wantEpoch {
+			t.Errorf("epoch = %x, want %x", gotEpoch, wantEpoch)
+		}
+		if gotSeq != wantSeq {
+			t.Errorf("seq = %d, want %d", gotSeq, wantSeq)
 		}
 		if !bytes.Equal(gotID, reqID) {
 			t.Errorf("reqID mismatch")
@@ -161,11 +177,11 @@ func TestProtocolEncoding(t *testing.T) {
 	t.Run("request frame oversize rejected", func(t *testing.T) {
 		var buf bytes.Buffer
 		reqID := bytes.Repeat([]byte{0xCD}, RequestIDSize)
-		if err := writeRequestFrame(&buf, reqID, "t", make([]byte, 1024)); err != nil {
+		if err := writeRequestFrame(&buf, 1, 1, reqID, "t", make([]byte, 1024)); err != nil {
 			t.Fatalf("writeRequestFrame: %v", err)
 		}
 		_, _ = readMsgType(&buf) // consume type byte
-		_, _, _, err := readRequestFrame(&buf, 100)
+		_, _, _, _, _, err := readRequestFrame(&buf, 100)
 		if !errors.Is(err, ErrFrameTooLarge) {
 			t.Errorf("expected ErrFrameTooLarge, got %v", err)
 		}

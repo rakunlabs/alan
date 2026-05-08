@@ -1,0 +1,606 @@
+----------------------------- MODULE LockSpecFIFO -----------------------------
+(***************************************************************************)
+(* Variant of LockSpec.tla with FIFO per-(sender, receiver) channels.       *)
+(*                                                                         *)
+(* Models the proposed fix: instead of opening a fresh QUIC stream per     *)
+(* lock message (which lets messages from the same peer arrive in any     *)
+(* order, since QUIC streams are independently flow-controlled), keep a   *)
+(* single persistent stream per peer pair and write all lock messages to  *)
+(* it serially. The receiver dispatches them on a single goroutine in the *)
+(* order received.                                                         *)
+(*                                                                         *)
+(* Modeling difference: `inbox[from][to]` is a sequence (FIFO). Senders    *)
+(* Append; receivers consume only Head().                                  *)
+(*                                                                         *)
+(* If MutualExclusion holds under this model, FIFO ordering is sufficient  *)
+(* to fix the reorder bug found in LockSpec.tla.                           *)
+(***************************************************************************)
+EXTENDS Naturals, FiniteSets, Sequences, TLC
+
+CONSTANTS
+    Peers,
+    MaxAttempts,
+    RequireQuorum,
+    EnableDisconnect
+
+ASSUME RequireQuorum    \in BOOLEAN
+ASSUME EnableDisconnect \in BOOLEAN
+ASSUME MaxAttempts \in Nat /\ MaxAttempts >= 1
+
+QuorumSize == (Cardinality(Peers) \div 2) + 1
+
+StateFree      == [tag |-> "Free"]
+StatePending   == [tag |-> "Pending"]
+StateSelfHeld  == [tag |-> "SelfHeld"]
+StateHeldBy(q) == [tag |-> "HeldBy", who |-> q]
+
+ReqID(p, n) == [peer |-> p, num |-> n]
+NoReq       == [peer |-> 0, num |-> 0]
+
+PeerIdx == CHOOSE f \in [Peers -> 1..Cardinality(Peers)] :
+              \A p, q \in Peers : p # q => f[p] # f[q]
+
+ReqLT(a, b) == \/ PeerIdx[a.peer] < PeerIdx[b.peer]
+               \/ /\ a.peer = b.peer
+                  /\ a.num  < b.num
+
+\* Wire messages now omit the redundant from/to (channel encodes it).
+MsgRequest(id) == [type |-> "Req",   id |-> id]
+MsgGrant(id)   == [type |-> "Grant", id |-> id]
+MsgDeny(id)    == [type |-> "Deny",  id |-> id]
+\* Release ALSO carries an id now: it identifies which acquisition is being
+\* released. handleLockRelease must check that the in-flight Rel matches
+\* the id that established the local HeldBy; stale Rels are dropped.
+MsgRelease(id) == [type |-> "Rel",   id |-> id]
+
+(*--algorithm LockFIFO
+
+variables
+    state    = [p \in Peers |-> StateFree],
+    myReq    = [p \in Peers |-> NoReq],
+    grants   = [p \in Peers |-> {}],
+    expected = [p \in Peers |-> {}],
+    visible  = [p \in Peers |-> {}],
+    attempts = [p \in Peers |-> 0],
+    severed  = {},
+
+    \* For each pair (from, to) the per-channel FIFO inbox.
+    \* inbox[from][to] is a sequence of messages.
+    inbox    = [from \in Peers |-> [to \in Peers |-> << >>]],
+
+    \* For each receiver, the requestID under which the current
+    \* speculative HeldBy entry was established. Used to ignore stale
+    \* Release messages whose id does not match.
+    heldByID = [p \in Peers |-> NoReq];
+
+define
+    HasQuorum(p) == (~RequireQuorum)
+                  \/ ((Cardinality(visible[p]) + 1) >= QuorumSize)
+
+    Holders         == { p \in Peers : state[p] = StateSelfHeld }
+    MutualExclusion == Cardinality(Holders) <= 1
+
+    TypeInv ==
+        /\ visible  \in [Peers -> SUBSET Peers]
+        /\ attempts \in [Peers -> 0..MaxAttempts]
+        /\ \A p \in Peers :
+              \/ state[p] = StateFree
+              \/ state[p] = StatePending
+              \/ state[p] = StateSelfHeld
+              \/ /\ state[p].tag = "HeldBy"
+                 /\ state[p].who \in Peers
+end define;
+
+\* PlusCal macro: append `m` to inbox[from][to] for every to in `tos`.
+macro Broadcast(from, tos, m) begin
+    inbox := [f \in Peers |->
+                IF f = from
+                THEN [t \in Peers |->
+                         IF t \in tos
+                         THEN Append(inbox[from][t], m)
+                         ELSE inbox[from][t]]
+                ELSE inbox[f]];
+end macro;
+
+\* Append a single message from `from` to `to`.
+macro SendOne(from, to, m) begin
+    inbox[from][to] := Append(inbox[from][to], m);
+end macro;
+
+process Peer \in Peers
+begin Loop:
+    while TRUE do
+        either
+            (* ---- Connect ---- *)
+            await visible[self] # (Peers \ {self});
+            with q \in (Peers \ {self}) \ visible[self] do
+                await {self, q} \notin severed;
+                visible[self] := visible[self] \cup {q} ||
+                visible[q]    := visible[q]    \cup {self};
+            end with;
+
+        or
+            (* ---- AcquireNoPeers ---- *)
+            await /\ state[self]   = StateFree
+                  /\ visible[self] = {}
+                  /\ attempts[self] < MaxAttempts
+                  /\ HasQuorum(self);
+            attempts[self] := attempts[self] + 1 ||
+            state[self]    := StateSelfHeld;
+
+        or
+            (* ---- AcquireStart ---- *)
+            await /\ state[self]   = StateFree
+                  /\ visible[self] # {}
+                  /\ attempts[self] < MaxAttempts
+                  /\ HasQuorum(self);
+            with newAttempt = attempts[self] + 1,
+                 rid        = ReqID(self, newAttempt),
+                 vis        = visible[self] do
+                attempts[self] := newAttempt ||
+                state[self]    := StatePending ||
+                myReq[self]    := rid ||
+                grants[self]   := {} ||
+                expected[self] := vis ||
+                inbox          := [f \in Peers |->
+                                     IF f = self
+                                     THEN [t \in Peers |->
+                                              IF t \in vis
+                                              THEN Append(inbox[self][t],
+                                                          MsgRequest(rid))
+                                              ELSE inbox[self][t]]
+                                     ELSE inbox[f]];
+            end with;
+
+        or
+            (* ---- ReceiveRequest: head of inbox[from][self] is "Req" ---- *)
+            with from \in Peers do
+                await /\ from # self
+                      /\ Len(inbox[from][self]) > 0
+                      /\ Head(inbox[from][self]).type = "Req";
+                with m = Head(inbox[from][self]) do
+                    if state[self] = StateFree then
+                        state[self]    := StateHeldBy(from) ||
+                        heldByID[self] := m.id ||
+                        inbox          := [inbox EXCEPT
+                            ![from][self] = Tail(inbox[from][self]),
+                            ![self][from] = Append(@, MsgGrant(m.id))];
+                    elsif state[self].tag = "HeldBy" \/ state[self] = StateSelfHeld then
+                        inbox := [inbox EXCEPT
+                            ![from][self] = Tail(inbox[from][self]),
+                            ![self][from] = Append(@, MsgDeny(m.id))];
+                    elsif state[self] = StatePending then
+                        if ReqLT(m.id, myReq[self]) then
+                            \* Incoming wins. Hand over, preempt, broadcast
+                            \* Release tagged with our (now-defunct) myReq[self]
+                            \* so peers can ignore stale Rels later.
+                            with myOldReq = myReq[self], vis = visible[self] do
+                                state[self]    := StateHeldBy(from) ||
+                                heldByID[self] := m.id ||
+                                myReq[self]    := NoReq ||
+                                grants[self]   := {} ||
+                                expected[self] := {} ||
+                                inbox := [f \in Peers |->
+                                    IF f = from
+                                    THEN [t \in Peers |->
+                                            IF t = self
+                                            THEN Tail(inbox[from][self])
+                                            ELSE inbox[from][t]]
+                                    ELSE IF f = self
+                                         THEN [t \in Peers |->
+                                                 IF t = from
+                                                 THEN Append(inbox[self][from],
+                                                             MsgGrant(m.id))
+                                                 ELSE IF t \in vis
+                                                      THEN Append(inbox[self][t],
+                                                                  MsgRelease(myOldReq))
+                                                      ELSE inbox[self][t]]
+                                         ELSE inbox[f]];
+                            end with;
+                        else
+                            inbox := [inbox EXCEPT
+                                ![from][self] = Tail(inbox[from][self]),
+                                ![self][from] = Append(@, MsgDeny(m.id))];
+                        end if;
+                    end if;
+                end with;
+            end with;
+
+        or
+            (* ---- ReceiveGrant ---- *)
+            with from \in Peers do
+                await /\ from # self
+                      /\ Len(inbox[from][self]) > 0
+                      /\ Head(inbox[from][self]).type = "Grant"
+                      /\ state[self] = StatePending
+                      /\ Head(inbox[from][self]).id = myReq[self];
+                with m = Head(inbox[from][self]) do
+                    if expected[self] \subseteq (grants[self] \cup {from}) then
+                        state[self]    := StateSelfHeld ||
+                        myReq[self]    := NoReq ||
+                        grants[self]   := {} ||
+                        expected[self] := {} ||
+                        inbox          := [inbox EXCEPT
+                            ![from][self] = Tail(inbox[from][self])];
+                    else
+                        grants[self] := grants[self] \cup {from} ||
+                        inbox        := [inbox EXCEPT
+                            ![from][self] = Tail(inbox[from][self])];
+                    end if;
+                end with;
+            end with;
+
+        or
+            (* ---- ReceiveDeny: abort, broadcast Release tagged with myReq ---- *)
+            with from \in Peers do
+                await /\ from # self
+                      /\ Len(inbox[from][self]) > 0
+                      /\ Head(inbox[from][self]).type = "Deny"
+                      /\ state[self] = StatePending
+                      /\ Head(inbox[from][self]).id = myReq[self];
+                with myOldReq = myReq[self], vis = visible[self] do
+                    state[self]    := StateFree ||
+                    myReq[self]    := NoReq ||
+                    grants[self]   := {} ||
+                    expected[self] := {} ||
+                    inbox := [f \in Peers |->
+                        IF f = from
+                        THEN [t \in Peers |->
+                                IF t = self
+                                THEN Tail(inbox[from][self])
+                                ELSE inbox[from][t]]
+                        ELSE IF f = self
+                             THEN [t \in Peers |->
+                                     IF t \in vis
+                                     THEN Append(inbox[self][t],
+                                                 MsgRelease(myOldReq))
+                                     ELSE inbox[self][t]]
+                             ELSE inbox[f]];
+                end with;
+            end with;
+
+        or
+            (* ---- DropDeny: Deny that no longer matches our myReq ---- *)
+            with from \in Peers do
+                await /\ from # self
+                      /\ Len(inbox[from][self]) > 0
+                      /\ Head(inbox[from][self]).type = "Deny"
+                      /\ \/ state[self] # StatePending
+                         \/ Head(inbox[from][self]).id # myReq[self];
+                inbox := [inbox EXCEPT
+                    ![from][self] = Tail(inbox[from][self])];
+            end with;
+
+        or
+            (* ---- DropGrant: Grant that no longer matches our myReq ---- *)
+            with from \in Peers do
+                await /\ from # self
+                      /\ Len(inbox[from][self]) > 0
+                      /\ Head(inbox[from][self]).type = "Grant"
+                      /\ \/ state[self] # StatePending
+                         \/ Head(inbox[from][self]).id # myReq[self];
+                inbox := [inbox EXCEPT
+                    ![from][self] = Tail(inbox[from][self])];
+            end with;
+
+        or
+            (* ---- ReceiveRelease ----
+               KEY FIX: the Release carries the requestID that established
+               the HeldBy entry on this peer. Stale Releases (from earlier
+               aborts, sent on a different stream/order in the old design)
+               do not match heldByID[self] and are dropped harmlessly.   *)
+            with from \in Peers do
+                await /\ from # self
+                      /\ Len(inbox[from][self]) > 0
+                      /\ Head(inbox[from][self]).type = "Rel";
+                with m = Head(inbox[from][self]) do
+                    if /\ state[self].tag = "HeldBy"
+                       /\ state[self].who = from
+                       /\ heldByID[self]  = m.id then
+                        state[self]    := StateFree ||
+                        heldByID[self] := NoReq ||
+                        inbox          := [inbox EXCEPT
+                            ![from][self] = Tail(inbox[from][self])];
+                    else
+                        inbox := [inbox EXCEPT
+                            ![from][self] = Tail(inbox[from][self])];
+                    end if;
+                end with;
+            end with;
+
+        or
+            (* ---- Disconnect: link torn down. Inboxes between the two
+               peers are flushed (the persistent stream is gone).        *)
+            await EnableDisconnect /\ visible[self] # {};
+            with q \in visible[self] do
+                visible[self] := visible[self] \ {q} ||
+                visible[q]    := visible[q]    \ {self} ||
+                severed       := severed \cup { {self, q} } ||
+
+                state[self]    := IF state[self].tag = "HeldBy"
+                                    /\ state[self].who = q
+                                  THEN StateFree
+                                  ELSE state[self] ||
+                state[q]       := IF state[q].tag = "HeldBy"
+                                    /\ state[q].who = self
+                                  THEN StateFree
+                                  ELSE state[q] ||
+                heldByID[self] := IF state[self].tag = "HeldBy"
+                                    /\ state[self].who = q
+                                  THEN NoReq
+                                  ELSE heldByID[self] ||
+                heldByID[q]    := IF state[q].tag = "HeldBy"
+                                    /\ state[q].who = self
+                                  THEN NoReq
+                                  ELSE heldByID[q] ||
+
+                expected[self] := IF state[self] = StatePending
+                                  THEN expected[self] \ {q}
+                                  ELSE expected[self] ||
+                expected[q]    := IF state[q] = StatePending
+                                  THEN expected[q] \ {self}
+                                  ELSE expected[q] ||
+
+                \* Flush the per-pair inboxes (stream lost).
+                inbox          := [inbox EXCEPT
+                    ![self][q] = << >>,
+                    ![q][self] = << >>];
+            end with;
+        end either;
+    end while;
+end process;
+
+end algorithm; *)
+\* BEGIN TRANSLATION (chksum(pcal) = "513a2276" /\ chksum(tla) = "de484cde")
+VARIABLES state, myReq, grants, expected, visible, attempts, severed, inbox, 
+          heldByID
+
+(* define statement *)
+HasQuorum(p) == (~RequireQuorum)
+              \/ ((Cardinality(visible[p]) + 1) >= QuorumSize)
+
+Holders         == { p \in Peers : state[p] = StateSelfHeld }
+MutualExclusion == Cardinality(Holders) <= 1
+
+TypeInv ==
+    /\ visible  \in [Peers -> SUBSET Peers]
+    /\ attempts \in [Peers -> 0..MaxAttempts]
+    /\ \A p \in Peers :
+          \/ state[p] = StateFree
+          \/ state[p] = StatePending
+          \/ state[p] = StateSelfHeld
+          \/ /\ state[p].tag = "HeldBy"
+             /\ state[p].who \in Peers
+
+
+vars == << state, myReq, grants, expected, visible, attempts, severed, inbox, 
+           heldByID >>
+
+ProcSet == (Peers)
+
+Init == (* Global variables *)
+        /\ state = [p \in Peers |-> StateFree]
+        /\ myReq = [p \in Peers |-> NoReq]
+        /\ grants = [p \in Peers |-> {}]
+        /\ expected = [p \in Peers |-> {}]
+        /\ visible = [p \in Peers |-> {}]
+        /\ attempts = [p \in Peers |-> 0]
+        /\ severed = {}
+        /\ inbox = [from \in Peers |-> [to \in Peers |-> << >>]]
+        /\ heldByID = [p \in Peers |-> NoReq]
+
+Peer(self) == \/ /\ visible[self] # (Peers \ {self})
+                 /\ \E q \in (Peers \ {self}) \ visible[self]:
+                      /\ {self, q} \notin severed
+                      /\ visible' = [visible EXCEPT ![self] = visible[self] \cup {q},
+                                                    ![q] = visible[q]    \cup {self}]
+                 /\ UNCHANGED <<state, myReq, grants, expected, attempts, severed, inbox, heldByID>>
+              \/ /\ /\ state[self]   = StateFree
+                    /\ visible[self] = {}
+                    /\ attempts[self] < MaxAttempts
+                    /\ HasQuorum(self)
+                 /\ /\ attempts' = [attempts EXCEPT ![self] = attempts[self] + 1]
+                    /\ state' = [state EXCEPT ![self] = StateSelfHeld]
+                 /\ UNCHANGED <<myReq, grants, expected, visible, severed, inbox, heldByID>>
+              \/ /\ /\ state[self]   = StateFree
+                    /\ visible[self] # {}
+                    /\ attempts[self] < MaxAttempts
+                    /\ HasQuorum(self)
+                 /\ LET newAttempt == attempts[self] + 1 IN
+                      LET rid == ReqID(self, newAttempt) IN
+                        LET vis == visible[self] IN
+                          /\ attempts' = [attempts EXCEPT ![self] = newAttempt]
+                          /\ expected' = [expected EXCEPT ![self] = vis]
+                          /\ grants' = [grants EXCEPT ![self] = {}]
+                          /\ inbox' = [f \in Peers |->
+                                         IF f = self
+                                         THEN [t \in Peers |->
+                                                  IF t \in vis
+                                                  THEN Append(inbox[self][t],
+                                                              MsgRequest(rid))
+                                                  ELSE inbox[self][t]]
+                                         ELSE inbox[f]]
+                          /\ myReq' = [myReq EXCEPT ![self] = rid]
+                          /\ state' = [state EXCEPT ![self] = StatePending]
+                 /\ UNCHANGED <<visible, severed, heldByID>>
+              \/ /\ \E from \in Peers:
+                      /\ /\ from # self
+                         /\ Len(inbox[from][self]) > 0
+                         /\ Head(inbox[from][self]).type = "Req"
+                      /\ LET m == Head(inbox[from][self]) IN
+                           IF state[self] = StateFree
+                              THEN /\ /\ heldByID' = [heldByID EXCEPT ![self] = m.id]
+                                      /\ inbox' =               [inbox EXCEPT
+                                                  ![from][self] = Tail(inbox[from][self]),
+                                                  ![self][from] = Append(@, MsgGrant(m.id))]
+                                      /\ state' = [state EXCEPT ![self] = StateHeldBy(from)]
+                                   /\ UNCHANGED << myReq, grants, expected >>
+                              ELSE /\ IF state[self].tag = "HeldBy" \/ state[self] = StateSelfHeld
+                                         THEN /\ inbox' =      [inbox EXCEPT
+                                                          ![from][self] = Tail(inbox[from][self]),
+                                                          ![self][from] = Append(@, MsgDeny(m.id))]
+                                              /\ UNCHANGED << state, myReq, 
+                                                              grants, 
+                                                              expected, 
+                                                              heldByID >>
+                                         ELSE /\ IF state[self] = StatePending
+                                                    THEN /\ IF ReqLT(m.id, myReq[self])
+                                                               THEN /\ LET myOldReq == myReq[self] IN
+                                                                         LET vis == visible[self] IN
+                                                                           /\ expected' = [expected EXCEPT ![self] = {}]
+                                                                           /\ grants' = [grants EXCEPT ![self] = {}]
+                                                                           /\ heldByID' = [heldByID EXCEPT ![self] = m.id]
+                                                                           /\ inbox' =      [f \in Peers |->
+                                                                                       IF f = from
+                                                                                       THEN [t \in Peers |->
+                                                                                               IF t = self
+                                                                                               THEN Tail(inbox[from][self])
+                                                                                               ELSE inbox[from][t]]
+                                                                                       ELSE IF f = self
+                                                                                            THEN [t \in Peers |->
+                                                                                                    IF t = from
+                                                                                                    THEN Append(inbox[self][from],
+                                                                                                                MsgGrant(m.id))
+                                                                                                    ELSE IF t \in vis
+                                                                                                         THEN Append(inbox[self][t],
+                                                                                                                     MsgRelease(myOldReq))
+                                                                                                         ELSE inbox[self][t]]
+                                                                                            ELSE inbox[f]]
+                                                                           /\ myReq' = [myReq EXCEPT ![self] = NoReq]
+                                                                           /\ state' = [state EXCEPT ![self] = StateHeldBy(from)]
+                                                               ELSE /\ inbox' =      [inbox EXCEPT
+                                                                                ![from][self] = Tail(inbox[from][self]),
+                                                                                ![self][from] = Append(@, MsgDeny(m.id))]
+                                                                    /\ UNCHANGED << state, 
+                                                                                    myReq, 
+                                                                                    grants, 
+                                                                                    expected, 
+                                                                                    heldByID >>
+                                                    ELSE /\ TRUE
+                                                         /\ UNCHANGED << state, 
+                                                                         myReq, 
+                                                                         grants, 
+                                                                         expected, 
+                                                                         inbox, 
+                                                                         heldByID >>
+                 /\ UNCHANGED <<visible, attempts, severed>>
+              \/ /\ \E from \in Peers:
+                      /\ /\ from # self
+                         /\ Len(inbox[from][self]) > 0
+                         /\ Head(inbox[from][self]).type = "Grant"
+                         /\ state[self] = StatePending
+                         /\ Head(inbox[from][self]).id = myReq[self]
+                      /\ LET m == Head(inbox[from][self]) IN
+                           IF expected[self] \subseteq (grants[self] \cup {from})
+                              THEN /\ /\ expected' = [expected EXCEPT ![self] = {}]
+                                      /\ grants' = [grants EXCEPT ![self] = {}]
+                                      /\ inbox' =               [inbox EXCEPT
+                                                  ![from][self] = Tail(inbox[from][self])]
+                                      /\ myReq' = [myReq EXCEPT ![self] = NoReq]
+                                      /\ state' = [state EXCEPT ![self] = StateSelfHeld]
+                              ELSE /\ /\ grants' = [grants EXCEPT ![self] = grants[self] \cup {from}]
+                                      /\ inbox' =             [inbox EXCEPT
+                                                  ![from][self] = Tail(inbox[from][self])]
+                                   /\ UNCHANGED << state, myReq, expected >>
+                 /\ UNCHANGED <<visible, attempts, severed, heldByID>>
+              \/ /\ \E from \in Peers:
+                      /\ /\ from # self
+                         /\ Len(inbox[from][self]) > 0
+                         /\ Head(inbox[from][self]).type = "Deny"
+                         /\ state[self] = StatePending
+                         /\ Head(inbox[from][self]).id = myReq[self]
+                      /\ LET myOldReq == myReq[self] IN
+                           LET vis == visible[self] IN
+                             /\ expected' = [expected EXCEPT ![self] = {}]
+                             /\ grants' = [grants EXCEPT ![self] = {}]
+                             /\ inbox' =      [f \in Peers |->
+                                         IF f = from
+                                         THEN [t \in Peers |->
+                                                 IF t = self
+                                                 THEN Tail(inbox[from][self])
+                                                 ELSE inbox[from][t]]
+                                         ELSE IF f = self
+                                              THEN [t \in Peers |->
+                                                      IF t \in vis
+                                                      THEN Append(inbox[self][t],
+                                                                  MsgRelease(myOldReq))
+                                                      ELSE inbox[self][t]]
+                                              ELSE inbox[f]]
+                             /\ myReq' = [myReq EXCEPT ![self] = NoReq]
+                             /\ state' = [state EXCEPT ![self] = StateFree]
+                 /\ UNCHANGED <<visible, attempts, severed, heldByID>>
+              \/ /\ \E from \in Peers:
+                      /\ /\ from # self
+                         /\ Len(inbox[from][self]) > 0
+                         /\ Head(inbox[from][self]).type = "Deny"
+                         /\ \/ state[self] # StatePending
+                            \/ Head(inbox[from][self]).id # myReq[self]
+                      /\ inbox' =      [inbox EXCEPT
+                                  ![from][self] = Tail(inbox[from][self])]
+                 /\ UNCHANGED <<state, myReq, grants, expected, visible, attempts, severed, heldByID>>
+              \/ /\ \E from \in Peers:
+                      /\ /\ from # self
+                         /\ Len(inbox[from][self]) > 0
+                         /\ Head(inbox[from][self]).type = "Grant"
+                         /\ \/ state[self] # StatePending
+                            \/ Head(inbox[from][self]).id # myReq[self]
+                      /\ inbox' =      [inbox EXCEPT
+                                  ![from][self] = Tail(inbox[from][self])]
+                 /\ UNCHANGED <<state, myReq, grants, expected, visible, attempts, severed, heldByID>>
+              \/ /\ \E from \in Peers:
+                      /\ /\ from # self
+                         /\ Len(inbox[from][self]) > 0
+                         /\ Head(inbox[from][self]).type = "Rel"
+                      /\ LET m == Head(inbox[from][self]) IN
+                           IF /\ state[self].tag = "HeldBy"
+                              /\ state[self].who = from
+                              /\ heldByID[self]  = m.id
+                              THEN /\ /\ heldByID' = [heldByID EXCEPT ![self] = NoReq]
+                                      /\ inbox' =               [inbox EXCEPT
+                                                  ![from][self] = Tail(inbox[from][self])]
+                                      /\ state' = [state EXCEPT ![self] = StateFree]
+                              ELSE /\ inbox' =      [inbox EXCEPT
+                                               ![from][self] = Tail(inbox[from][self])]
+                                   /\ UNCHANGED << state, heldByID >>
+                 /\ UNCHANGED <<myReq, grants, expected, visible, attempts, severed>>
+              \/ /\ EnableDisconnect /\ visible[self] # {}
+                 /\ \E q \in visible[self]:
+                      /\ expected' = [expected EXCEPT ![self] = IF state[self] = StatePending
+                                                                THEN expected[self] \ {q}
+                                                                ELSE expected[self],
+                                                      ![q] = IF state[q] = StatePending
+                                                             THEN expected[q] \ {self}
+                                                             ELSE expected[q]]
+                      /\ heldByID' = [heldByID EXCEPT ![self] = IF state[self].tag = "HeldBy"
+                                                                  /\ state[self].who = q
+                                                                THEN NoReq
+                                                                ELSE heldByID[self],
+                                                      ![q] = IF state[q].tag = "HeldBy"
+                                                               /\ state[q].who = self
+                                                             THEN NoReq
+                                                             ELSE heldByID[q]]
+                      /\ inbox' =               [inbox EXCEPT
+                                  ![self][q] = << >>,
+                                  ![q][self] = << >>]
+                      /\ severed' = (severed \cup { {self, q} })
+                      /\ state' = [state EXCEPT ![self] = IF state[self].tag = "HeldBy"
+                                                            /\ state[self].who = q
+                                                          THEN StateFree
+                                                          ELSE state[self],
+                                                ![q] = IF state[q].tag = "HeldBy"
+                                                         /\ state[q].who = self
+                                                       THEN StateFree
+                                                       ELSE state[q]]
+                      /\ visible' = [visible EXCEPT ![self] = visible[self] \ {q},
+                                                    ![q] = visible[q]    \ {self}]
+                 /\ UNCHANGED <<myReq, grants, attempts>>
+
+Next == (\E self \in Peers: Peer(self))
+
+Spec == Init /\ [][Next]_vars
+
+\* END TRANSLATION 
+
+\* No symmetry: PeerIdx breaks it.
+
+=============================================================================

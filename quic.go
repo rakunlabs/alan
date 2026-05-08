@@ -22,7 +22,7 @@ const (
 	// QUIC/TLS handshake. Bumping this is the supported way to make a
 	// breaking wire-format change: peers running a different ALPN simply
 	// fail the handshake and never become members.
-	alpnProtocol = "alan/2"
+	alpnProtocol = "alan/3"
 	// pskPrefix is mixed into the PSK hash so the same Key cannot be reused
 	// to authenticate against any other system that hashes the same secret.
 	pskPrefix = "github.com/rakunlabs/alan/psk"

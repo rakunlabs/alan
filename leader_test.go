@@ -285,14 +285,16 @@ func TestRunAsLeader_NoQuorumAfterPeerLoss(t *testing.T) {
 		Port:              port1,
 		Replicas:          3,
 		HeartbeatInterval: 200 * time.Millisecond,
-		HeartbeatTimeout:  1500 * time.Millisecond,
+		HeartbeatTimeout:           1500 * time.Millisecond,
+		LockAcquireMembershipWait: 200 * time.Millisecond,
 	})
 	a2, _ := New(Config{
 		BindAddr:          "127.0.0.1",
 		Port:              port2,
 		Replicas:          3,
 		HeartbeatInterval: 200 * time.Millisecond,
-		HeartbeatTimeout:  1500 * time.Millisecond,
+		HeartbeatTimeout:           1500 * time.Millisecond,
+		LockAcquireMembershipWait: 200 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -369,7 +371,8 @@ func TestRunAsLeader_3Peers_FailoverElectsNewLeader(t *testing.T) {
 			Port:              port,
 			Replicas:          3,
 			HeartbeatInterval: 200 * time.Millisecond,
-			HeartbeatTimeout:  1500 * time.Millisecond,
+			HeartbeatTimeout:           1500 * time.Millisecond,
+		LockAcquireMembershipWait: 200 * time.Millisecond,
 		})
 		if err != nil {
 			t.Fatalf("New failed: %v", err)
@@ -486,14 +489,16 @@ func TestRunAsLeader_StepsDownOnQuorumLoss(t *testing.T) {
 		Port:              port1,
 		Replicas:          3,
 		HeartbeatInterval: 200 * time.Millisecond,
-		HeartbeatTimeout:  1500 * time.Millisecond,
+		HeartbeatTimeout:           1500 * time.Millisecond,
+		LockAcquireMembershipWait: 200 * time.Millisecond,
 	})
 	a2, _ := New(Config{
 		BindAddr:          "127.0.0.1",
 		Port:              port2,
 		Replicas:          3,
 		HeartbeatInterval: 200 * time.Millisecond,
-		HeartbeatTimeout:  1500 * time.Millisecond,
+		HeartbeatTimeout:           1500 * time.Millisecond,
+		LockAcquireMembershipWait: 200 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

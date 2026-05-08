@@ -1,0 +1,13 @@
+# PlusCal translator emits a default config we do not use (we ship our
+# own LockSpec_*.cfg / LockSpecFIFO_*.cfg).
+LockSpec.cfg
+LockSpecFIFO.cfg
+
+# TLC trace-exploration spec written next to the violated invariant.
+*_TTrace_*.tla
+
+# TLC scratch / state directories.
+states/
+*.dot
+*.dot.txt
+*.bin

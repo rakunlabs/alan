@@ -227,6 +227,38 @@ Notes:
   Use `SendStream` / `HandleStream` for one-way streaming workloads.
 - Request ID correlation is handled by the library.
 
+## Lock acquisition: warm-start guard
+
+When `Replicas` is set, the first `Lock` call after `Start` waits up
+to `LockAcquireMembershipWait` (default 5 s) for the full peer set to
+come online before deciding to acquire. This closes the
+"partial-visibility startup race" — a quorum-as-majority check is
+satisfied as soon as `|visible| + 1 ≥ majority`, which a freshly-
+booting peer can hit by reaching just one fellow survivor without
+ever handshaking with the actual lock holder. Without the wait, two
+peers would end up `SelfHeld` simultaneously. See
+`tla/LockSpecFIFO_PartialVisibility.tla` for the model and the
+counter-example.
+
+The wait fires AT MOST ONCE per Alan instance — once it returns
+(whether full membership was reached, the timeout elapsed, or the
+context was cancelled), an internal `membershipSettled` flag is set
+and every subsequent `Lock` skips the wait. So:
+
+- Cold start with eventually-full cluster: first lock waits a brief
+  window for handshakes, then runs at full speed forever after.
+- Cold start with a permanently-undersized cluster (e.g. Replicas=3,
+  but only 2 peers ever boot): first lock pays the full
+  `LockAcquireMembershipWait`, then settles into "this is what we have"
+  mode; subsequent locks have no extra latency.
+- Failover (a peer dies after the cluster was once full): no wait,
+  because membership had already settled before the death.
+
+Set `LockAcquireMembershipWait` to a negative value to disable the
+guard entirely (useful in tests or in deployments that pin startup
+order via OrderedReady / `maxSurge: 0`, where the race is impossible
+by construction).
+
 ## Distributed Locking
 
 ```go
@@ -425,13 +457,14 @@ Every QUIC stream carries exactly one logical message. The first byte is the
 
 | Hex | Type | Frame |
 |----:|------|-------|
-| `0x10` | `Data` | `[0x10][TypeLen:2][Type:T] <body until FIN>` |
-| `0x20` | `Request` | `[0x20][RequestID:16][TypeLen:2][Type:T][BodyLen:varint][Body]` |
-| `0x21` | `Response` | `[0x21][RequestID:16][BodyLen:varint][Body]` |
-| `0x30` | `LockRequest` | `[0x30][RequestID:16][KeyLen:2][Key]` |
-| `0x31` | `LockGrant` | `[0x31][RequestID:16][KeyLen:2][Key]` |
-| `0x32` | `LockDeny` | `[0x32][RequestID:16][KeyLen:2][Key]` |
-| `0x33` | `LockRelease` | `[0x33][RequestID:16][KeyLen:2][Key]` |
+| `0x10` | `Data` | `[0x10][Epoch:8][Seq:8][TypeLen:2][Type:T] <body until FIN>` |
+| `0x20` | `Request` | `[0x20][Epoch:8][Seq:8][RequestID:16][TypeLen:2][Type:T][BodyLen:varint][Body]` |
+| `0x21` | `Response` | `[0x21][RequestID:16][BodyLen:varint][Body]` (no Epoch/Seq; Response order is irrelevant — correlated by RequestID) |
+| `0x50` | `LockMux` | `[0x50] <lock frames until FIN>` (long-lived per-peer stream; one per direction) |
+| `0x30` | `LockRequest` | `[0x30][RequestID:16][KeyLen:2][Key]` (inside a `LockMux` stream) |
+| `0x31` | `LockGrant` | `[0x31][RequestID:16][KeyLen:2][Key]` (inside a `LockMux` stream) |
+| `0x32` | `LockDeny` | `[0x32][RequestID:16][KeyLen:2][Key]` (inside a `LockMux` stream) |
+| `0x33` | `LockRelease` | `[0x33][RequestID:16][KeyLen:2][Key]` (inside a `LockMux` stream); RequestID identifies the acquisition being released — see "Lock messages: FIFO over a single per-peer stream" |
 
 Notes:
 - `Data` bodies are **FIN-delimited** — the sender doesn't need to know the
@@ -445,12 +478,63 @@ Notes:
 
 ### Message Ordering
 
-- **Byte handlers** (`Handle`): messages from the same peer are dispatched in
-  order. Each peer has a dedicated channel and worker goroutine.
+- **Byte handlers** (`Handle`): messages from the same peer are dispatched
+  to the handler in **strict send order**. Each `Send` / `SendTo` /
+  `SendAndWaitReply` / `SendToAndWaitReply` call stamps the outgoing
+  Data or Request frame with a connection epoch and a per-peer
+  monotonic sequence number; the receiver re-orders by sequence before
+  invoking the handler. This holds even when the sender fires
+  concurrent calls from different goroutines and even when payload
+  sizes vary by orders of magnitude (small messages no longer drain
+  ahead of large ones).
+  - **Reconnect:** the epoch field protects against a sender restarting
+    its sequence counter after a reconnect — when the receiver sees a
+    new epoch it discards any half-buffered out-of-order state and
+    accepts the new `seq=1` cleanly.
+  - **Counter wrap:** the per-peer outbound sequence counter is a
+    uint64 that wraps cleanly from 2^64-1 back to 0. The receiver
+    compares seq numbers modularly (signed-difference test on the
+    unsigned value, the same trick TCP's PAWS uses), so a wrap is a
+    no-op event for ordering — no rotation, no reset, no message loss.
+    Reaching 2^64 frames on a single connection takes ~584 years at
+    one nanosecond per frame, so the wrap is purely defensive.
 - **Stream handlers** (`HandleStream`): each accepted stream spawns its own
   goroutine and reads the body directly. Messages from the same peer may be
   processed concurrently. If you need ordered streaming, register a byte
   handler and dispatch internally.
+- **Lock messages**: strictly FIFO per (sender → receiver) — see below.
+
+### Lock messages: FIFO over a single per-peer stream
+
+Each pair of peers shares one long-lived QUIC stream per direction
+(`MsgTypeLockMux = 0x50`) onto which alan serialises every outgoing
+lock frame (`LockRequest` / `LockGrant` / `LockDeny` / `LockRelease`).
+The receiver reads frames from that stream in a single goroutine and
+dispatches them in order. Two practical consequences:
+
+- Sender-side: a `lockSendMu` mutex guards the persistent stream; only
+  one goroutine writes at a time, so frames hit the wire in the order
+  the lock state machine produced them.
+- Receiver-side: a single accept-stream goroutine consumes all lock
+  frames from one peer in arrival order, so the local lock state
+  machine sees them in the same order the sender emitted.
+
+This matters because earlier versions opened a fresh QUIC stream per
+lock frame. QUIC streams are independently flow-controlled and reorder
+freely relative to one another, so a stale `LockRelease` from an
+earlier aborted acquisition could arrive *after* a fresh `LockGrant`,
+clobbering a freshly-recorded `HeldBy` entry on the receiver and
+violating mutual exclusion even with quorum and no partitions. The
+single-stream-per-pair design eliminates that reorder window. The
+reorder bug, the FIFO fix, and the proof are all in `tla/` — see
+[`tla/README.md`](tla/README.md).
+
+In addition to FIFO ordering, every `LockRelease` frame now carries
+the requestID that established the corresponding `HeldBy` entry on
+the receiver. The receiver compares `m.id` against the locally-stored
+`holderID` and drops releases whose id does not match. This is a
+defence-in-depth guard against any residual reorder window (e.g. a
+stream torn down and re-opened across a brief connectivity blip).
 
 ### Message Size Limits
 
@@ -667,9 +751,17 @@ var (
 
 This release breaks both source compatibility and wire compatibility:
 
-- **Wire (ALPN bump):** the protocol identifier moved from `alan/1` to
-  `alan/2`. Old peers fail the TLS handshake against new peers — there is
-  no silent corruption. Upgrade all peers together.
+- **Wire (ALPN bump):** the protocol identifier moved from `alan/2` to
+  `alan/3`. Old peers fail the TLS handshake against new peers — there is
+  no silent corruption. Upgrade all peers together. This release
+  introduces two wire changes:
+  1. Data and Request frames now carry an 8-byte per-peer monotonic
+     sequence number used by the receiver for in-order dispatch.
+  2. Lock frames are multiplexed onto a single persistent stream per
+     peer pair (`MsgTypeLockMux = 0x50`), and `LockRelease` carries the
+     requestID that established the corresponding `HeldBy` entry on
+     the receiver. See "Lock messages: FIFO over a single per-peer
+     stream" below.
 - **Source:** every `Send` / `SendTo` / `SendStream` / `SendToStream` /
   `SendAndWaitReply` / `SendToAndWaitReply` / `Reply` / `Lock` / `TryLock` /
   `Unlock` call now takes `context.Context` as the first argument. Pass

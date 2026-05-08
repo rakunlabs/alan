@@ -80,6 +80,13 @@ func (a *Alan) Unlock(ctx context.Context, key string) error {
 	}
 
 	waiters := state.waiters
+	// Capture the requestID under which we acquired this lock so the
+	// outgoing Release frames can be tagged with it. Receivers compare
+	// against state.holderID and ignore any Release whose id does not
+	// match — this is what prevents a stale abort-Release from clobbering
+	// a freshly-granted HeldBy entry on the receiver. See
+	// tla/LockSpecFIFO.tla for the model.
+	releaseID := state.holderID
 	delete(a.locks, key)
 	a.locksMu.Unlock()
 
@@ -93,7 +100,7 @@ func (a *Alan) Unlock(ctx context.Context, key string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	a.broadcastLockRelease(ctx, key)
+	a.broadcastLockRelease(ctx, releaseID, key)
 	return nil
 }
 
@@ -111,6 +118,18 @@ func (a *Alan) Unlock(ctx context.Context, key string) error {
 // requests on this peer can then tie-break against our pending ID even
 // if they arrive faster than we can register grant handlers.
 func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struct{}) {
+	// Best-effort wait for full peer membership before deciding to
+	// acquire. Closes the partial-visibility startup race captured by
+	// tla/LockSpecFIFO_PartialVisibility: a peer that meets quorum-
+	// as-majority via a single fellow survivor (without ever having
+	// handshaken with the actual lock holder) could otherwise be
+	// granted the lock by the survivor alone, producing two
+	// simultaneous holders. Waiting for full membership lets the
+	// missing handshake complete; if it never does (a peer is genuinely
+	// dead) we fall back to the bounded-quorum behaviour so failover
+	// still works.
+	a.waitForFullMembership(ctx)
+
 	a.locksMu.Lock()
 
 	if state, exists := a.locks[key]; exists {
@@ -127,6 +146,12 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 		return false, waitCh
 	}
 
+	requestID := make([]byte, RequestIDSize)
+	if _, err := rand.Read(requestID); err != nil {
+		a.locksMu.Unlock()
+		return false, nil
+	}
+
 	peerConns := a.peers.connAddrs()
 	if len(peerConns) == 0 {
 		// No peers to ask. Only grant the lock locally if quorum allows
@@ -137,15 +162,12 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 			a.locksMu.Unlock()
 			return false, nil
 		}
-		a.locks[key] = &lockState{holder: nil, waiters: nil}
+		// Self-grant. Record requestID as the acquireID even though no
+		// peer will Release it; if a peer joins later and we Unlock,
+		// the outbound Release carries this id.
+		a.locks[key] = &lockState{holder: nil, holderID: requestID, waiters: nil}
 		a.locksMu.Unlock()
 		return true, nil
-	}
-
-	requestID := make([]byte, RequestIDSize)
-	if _, err := rand.Read(requestID); err != nil {
-		a.locksMu.Unlock()
-		return false, nil
 	}
 
 	// Publish our intent to the local lock state map BEFORE broadcasting,
@@ -168,8 +190,10 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 	a.pendingLocksMu.Unlock()
 
 	// Cleanup helper: removes our pending state. If acquired, transitions
-	// to self-held; otherwise, drops the pending marker so other callers
-	// or remote requests see a clean slate.
+	// to self-held and stamps holderID with the requestID we won under,
+	// so a later Unlock can broadcast a Release tagged with that id.
+	// Otherwise, drops the pending marker so other callers or remote
+	// requests see a clean slate.
 	cleanup := func(acquired bool) {
 		a.pendingLocksMu.Lock()
 		delete(a.pendingLocks, reqKey)
@@ -182,6 +206,7 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 			if state.holder == nil && bytes.Equal(state.pending, requestID) {
 				if acquired {
 					state.pending = nil
+					state.holderID = requestID
 				} else {
 					delete(a.locks, key)
 				}
@@ -212,10 +237,16 @@ func (a *Alan) tryAcquireLock(ctx context.Context, key string) (bool, chan struc
 	abort := func() {
 		cleanup(false)
 		// Best-effort: release on every peer so any speculative
-		// holder = us state is cleared cluster-wide.
+		// holder = us state is cleared cluster-wide. Tag the Release
+		// with our pending requestID — receivers compare against the
+		// holderID they recorded on grant; if they have already
+		// granted us under this id, the Release matches and clears
+		// HeldBy(us). If they have since granted a different
+		// acquisition (different requestID), the Release id will not
+		// match and they harmlessly drop it.
 		releaseCtx, cancel := context.WithTimeout(context.Background(), a.config.Timeout)
 		defer cancel()
-		a.broadcastLockRelease(releaseCtx, key)
+		a.broadcastLockRelease(releaseCtx, requestID, key)
 	}
 
 	for grants < needed {
@@ -271,21 +302,29 @@ func (a *Alan) broadcastLockRequest(ctx context.Context, requestID []byte, key s
 		wg.Add(1)
 		go func(addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			_ = a.sendLockMsg(ctx, conn, MsgTypeLockRequest, requestID, key)
+			_ = a.sendLockMsg(ctx, addr, conn, MsgTypeLockRequest, requestID, key)
 		}(pc.Addr, pc.Conn)
 	}
 	wg.Wait()
 }
 
-func (a *Alan) broadcastLockRelease(ctx context.Context, key string) {
-	requestID := make([]byte, RequestIDSize)
+// broadcastLockRelease sends a LockRelease tagged with the requestID that
+// established the holder entry on receivers. Stale releases (from a
+// previous abort, in-flight when the peer re-acquires) carry the old
+// requestID and are dropped by handleLockRelease's id check.
+func (a *Alan) broadcastLockRelease(ctx context.Context, requestID []byte, key string) {
+	if len(requestID) != RequestIDSize {
+		// Defensive: an empty requestID would clear any current holder
+		// regardless of which acquisition is being released. Refuse.
+		return
+	}
 	peerConns := a.peers.connAddrs()
 	var wg sync.WaitGroup
 	for _, pc := range peerConns {
 		wg.Add(1)
 		go func(addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			_ = a.sendLockMsg(ctx, conn, MsgTypeLockRelease, requestID, key)
+			_ = a.sendLockMsg(ctx, addr, conn, MsgTypeLockRelease, requestID, key)
 		}(pc.Addr, pc.Conn)
 	}
 	wg.Wait()
@@ -296,7 +335,7 @@ func (a *Alan) sendLockResponse(ctx context.Context, msgType byte, requestID []b
 	if !ok {
 		return
 	}
-	_ = a.sendLockMsg(ctx, conn, msgType, requestID, key)
+	_ = a.sendLockMsg(ctx, addr, conn, msgType, requestID, key)
 }
 
 // releaseLocksHeldBy releases any locks the departing peer held and
@@ -360,8 +399,11 @@ func (a *Alan) handleLockRequest(requestID []byte, key string, sourceAddr *net.U
 	a.locksMu.Lock()
 	state, exists := a.locks[key]
 	if !exists {
-		// Unowned, no local pending: grant.
-		a.locks[key] = &lockState{holder: sourceAddr, waiters: nil}
+		// Unowned, no local pending: grant. Record the requester's
+		// requestID as holderID so a later Release tagged with the
+		// same id matches and clears the entry; releases tagged with
+		// any other id are dropped.
+		a.locks[key] = &lockState{holder: sourceAddr, holderID: requestID, waiters: nil}
 		a.locksMu.Unlock()
 		a.sendLockResponse(ctx, MsgTypeLockGrant, requestID, key, sourceAddr)
 		return
@@ -390,7 +432,11 @@ func (a *Alan) handleLockRequest(requestID []byte, key string, sourceAddr *net.U
 		// will observe `preempted` and retry; its cleanup will see
 		// holder != nil and skip clobbering.
 		myPending := state.pending
-		a.locks[key] = &lockState{holder: sourceAddr, waiters: state.waiters}
+		a.locks[key] = &lockState{
+			holder:   sourceAddr,
+			holderID: requestID,
+			waiters:  state.waiters,
+		}
 		a.locksMu.Unlock()
 
 		// Signal preemption to the in-flight pending so it gives up.
@@ -451,24 +497,39 @@ func (a *Alan) handleLockDeny(requestID []byte, _ string, sourceAddr *net.UDPAdd
 	}
 }
 
-func (a *Alan) handleLockRelease(key string, sourceAddr *net.UDPAddr) {
+// handleLockRelease processes an incoming LockRelease. Releases are
+// matched by (sourceAddr, holderID): only a Release whose requestID
+// equals the id under which the local HeldBy entry was established
+// clears it. Releases bearing any other id are dropped. This guards
+// against the stale-Release race that motivated tla/LockSpecFIFO.tla:
+// a Release sent during an earlier abort can arrive AFTER a fresh
+// acquisition grant; without the id check it would clobber the new
+// holder.
+func (a *Alan) handleLockRelease(requestID []byte, key string, sourceAddr *net.UDPAddr) {
 	a.locksMu.Lock()
 	state, exists := a.locks[key]
 	if !exists {
 		a.locksMu.Unlock()
 		return
 	}
-	if state.holder != nil && state.holder.String() == sourceAddr.String() {
-		waiters := state.waiters
-		delete(a.locks, key)
+	if state.holder == nil || state.holder.String() != sourceAddr.String() {
+		// Not held by this peer — nothing to do.
 		a.locksMu.Unlock()
-		for _, ch := range waiters {
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
-		}
 		return
 	}
+	if !bytes.Equal(state.holderID, requestID) {
+		// Stale Release from a previous acquisition by the same peer.
+		// Drop it; the current HeldBy entry stays intact.
+		a.locksMu.Unlock()
+		return
+	}
+	waiters := state.waiters
+	delete(a.locks, key)
 	a.locksMu.Unlock()
+	for _, ch := range waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }

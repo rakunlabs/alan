@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -17,9 +18,10 @@ import (
 
 // Default sizes / timeouts. See Config field docs for semantics.
 const (
-	defaultMaxMessageSize    = int64(16 * 1024 * 1024)  // 16 MiB
-	defaultMessageQueueBytes = int64(256 * 1024 * 1024) // 256 MiB
-	defaultStreamOpenTimeout = 10 * time.Second
+	defaultMaxMessageSize            = int64(16 * 1024 * 1024)  // 16 MiB
+	defaultMessageQueueBytes         = int64(256 * 1024 * 1024) // 256 MiB
+	defaultStreamOpenTimeout         = 10 * time.Second
+	defaultLockAcquireMembershipWait = 5 * time.Second
 )
 
 // Sentinel errors.
@@ -95,6 +97,31 @@ type Config struct {
 	// Replicas is the expected total cluster size (including self) for
 	// distributed operations such as quorum and locks. 0 disables.
 	Replicas int `cfg:"replicas" json:"replicas"`
+
+	// LockAcquireMembershipWait bounds how long a Lock acquisition will
+	// wait for the full peer set (PeerCount + 1 == Replicas) to come
+	// online before falling back to a quorum-only acquire.
+	//
+	// Why this exists: at startup, peers come up one at a time and
+	// QUIC handshakes complete in arbitrary order. A peer that meets
+	// quorum-as-majority (e.g. visible={one_other_peer} on a 3-peer
+	// cluster, |visible|+1 = 2 = majority) can satisfy HasQuorum
+	// against a *fellow survivor* without ever having handshaken with
+	// the actual lock holder. If that holder has already acquired (a
+	// "warm start" scenario, or a held leadership the new peer is
+	// joining behind), the new peer's grant-only-from-the-survivor
+	// acquisition succeeds and produces two simultaneous SelfHeld
+	// peers — the bug captured by tla/LockSpecFIFO_PartialVisibility.
+	//
+	// Waiting for full membership at acquisition time closes that
+	// window without breaking failover: when a real peer has died and
+	// the cluster genuinely runs at less than Replicas, the timer
+	// fires and the acquisition proceeds with whatever peers are
+	// reachable.
+	//
+	// Default: 5 seconds. Set to a negative value to disable the wait
+	// entirely (back to the pre-fix behaviour).
+	LockAcquireMembershipWait time.Duration `cfg:"lock_acquire_membership_wait" json:"lock_acquire_membership_wait"`
 }
 
 // SecurityConfig holds the optional pre-shared cluster admission key.
@@ -188,6 +215,13 @@ type peerEvent struct {
 // peerQueue manages ordered message processing for a single peer's byte
 // handlers. The byte budget enforces backpressure when a peer floods the
 // instance with large messages.
+//
+// Send-order delivery is enforced by the per-peer sequence number stamped
+// on every Data and Request frame: enqueueMessage either dispatches a
+// message immediately (when its seq matches nextSeq) or buffers it in
+// pending until earlier-seq messages arrive. Frames carrying seq==0 are
+// passed through unordered (used for synthetic / control deliveries that
+// do not need ordering).
 type peerQueue struct {
 	ch     chan queuedMessage
 	cancel context.CancelFunc
@@ -196,6 +230,31 @@ type peerQueue struct {
 	cond     *sync.Cond
 	bytes    int64
 	capBytes int64
+
+	// nextSeq is the sequence number of the next message we will
+	// release to the worker channel. Starts at 1 (sender numbering is
+	// 1-based; seq=0 bypasses ordering).
+	nextSeq uint64
+	// pending holds messages whose seq is greater than nextSeq, waiting
+	// for the gap to close. Sized at most by MaxMessageQueueSize per
+	// peer (same cap as ch).
+	pending map[uint64]queuedMessage
+	// curEpoch is the connection epoch of the most recent in-order
+	// frame we have processed. When an incoming frame carries a
+	// different epoch, the sender has reconnected and reset its seq
+	// counter; we drop the contents of `pending` and reset nextSeq
+	// before processing the new frame. 0 = never seen any epoch yet.
+	curEpoch uint64
+
+	// releaseMu serialises writes to ch from concurrent enqueueMessage
+	// calls that have observed seq == nextSeq. Without it, two
+	// callers could pop ready messages from `pending` under mu, drop
+	// mu, and race on ch — letting a higher-seq message overtake a
+	// lower-seq one and thus violating per-peer FIFO. With releaseMu
+	// the channel writes happen in seq order. mu is NOT held while
+	// blocking on ch (which would deadlock against the budget cond);
+	// releaseMu is the orthogonal "writer ordering" lock.
+	releaseMu sync.Mutex
 }
 
 // queuedMessage carries a message plus its accounted size through the queue.
@@ -208,13 +267,19 @@ type queuedMessage struct {
 //
 // Encoding of "who holds it":
 //   - holder == nil && pending == nil: we hold the lock locally.
+//     holderID is the requestID under which we acquired it (used in
+//     LockRelease frames so receivers can drop stale releases).
 //   - holder == nil && pending != nil: we have an in-flight acquisition;
 //     pending is the local requestID used for tie-breaking.
 //   - holder != nil: a remote peer holds the lock at that address.
+//     holderID is the requestID it used to acquire (echoed back to us
+//     in the LockRequest); we drop incoming Releases whose id does not
+//     match.
 type lockState struct {
-	holder  *net.UDPAddr
-	pending []byte
-	waiters []chan struct{}
+	holder   *net.UDPAddr
+	holderID []byte
+	pending  []byte
+	waiters  []chan struct{}
 }
 
 // pendingLock tracks an in-flight lock request.
@@ -291,6 +356,14 @@ type Alan struct {
 	// leader
 	leaderMu sync.RWMutex
 	leaders  map[string]struct{}
+
+	// membershipSettled is set once the cluster has either reached full
+	// peer membership at least once, or LockAcquireMembershipWait has
+	// elapsed against an unreached target. Once true, future lock
+	// acquisitions skip the membership wait — the partial-visibility
+	// startup window has closed and any peer that disconnects later is
+	// a normal failover scenario the existing quorum logic handles.
+	membershipSettled atomic.Bool
 }
 
 // New creates a new Alan instance with the given configuration.
@@ -321,6 +394,9 @@ func New(config Config) (*Alan, error) {
 	}
 	if config.StreamOpenTimeout == 0 {
 		config.StreamOpenTimeout = defaultStreamOpenTimeout
+	}
+	if config.LockAcquireMembershipWait == 0 {
+		config.LockAcquireMembershipWait = defaultLockAcquireMembershipWait
 	}
 
 	if config.Security.Enabled && len(config.Security.Key) == 0 {
@@ -629,7 +705,7 @@ func (a *Alan) Send(ctx context.Context, msgType string, data []byte) []SendResu
 		wg.Add(1)
 		go func(idx int, addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			n, err := a.sendDataBytes(ctx, conn, msgType, data)
+			n, err := a.sendDataBytes(ctx, addr, conn, msgType, data)
 			results[idx] = SendResult{Addr: addr, Sent: n, Error: err}
 		}(i, pc.Addr, pc.Conn)
 	}
@@ -650,7 +726,7 @@ func (a *Alan) SendTo(ctx context.Context, addr *net.UDPAddr, msgType string, da
 	if !ok {
 		return 0, ErrNoPeerConnection
 	}
-	n, err := a.sendDataBytes(ctx, conn, msgType, data)
+	n, err := a.sendDataBytes(ctx, addr, conn, msgType, data)
 	return int(n), err
 }
 
@@ -733,10 +809,10 @@ func (a *Alan) SendAndWaitReply(ctx context.Context, msgType string, data []byte
 	var wg sync.WaitGroup
 	for _, pc := range peerConns {
 		wg.Add(1)
-		go func(conn *quic.Conn) {
+		go func(addr *net.UDPAddr, conn *quic.Conn) {
 			defer wg.Done()
-			_ = a.sendRequest(ctx, conn, requestID, msgType, data)
-		}(pc.Conn)
+			_ = a.sendRequest(ctx, addr, conn, requestID, msgType, data)
+		}(pc.Addr, pc.Conn)
 	}
 	wg.Wait()
 
@@ -800,7 +876,7 @@ func (a *Alan) SendToAndWaitReply(ctx context.Context, addr *net.UDPAddr, msgTyp
 		a.pendingRequestsMu.Unlock()
 	}()
 
-	if err := a.sendRequest(ctx, conn, requestID, msgType, data); err != nil {
+	if err := a.sendRequest(ctx, addr, conn, requestID, msgType, data); err != nil {
 		return nil, err
 	}
 
@@ -852,15 +928,30 @@ func (a *Alan) openStream(ctx context.Context, conn *quic.Conn) (*quic.Stream, e
 	return stream, nil
 }
 
-// sendDataBytes opens a stream and writes a complete data frame.
-func (a *Alan) sendDataBytes(ctx context.Context, conn *quic.Conn, msgType string, data []byte) (int64, error) {
+// sendDataBytes opens a stream and writes a complete byte-mode Data
+// frame. The frame is stamped with the connection epoch and a per-peer
+// monotonic sequence number drawn from the Peer's atomic counter
+// BEFORE the stream is opened — this guarantees that two concurrent
+// sendDataBytes calls to the same peer produce frames with seq numbers
+// that match the order they were issued from the application's
+// perspective.
+//
+// Caveat: stream open / write order is not necessarily the same as the
+// seq order, but the receiver re-orders by seq before dispatching, so
+// handler invocation is always in send order.
+func (a *Alan) sendDataBytes(ctx context.Context, addr *net.UDPAddr, conn *quic.Conn, msgType string, data []byte) (int64, error) {
+	epoch, seq, ok := a.peers.nextOutboundFrame(addr)
+	if !ok {
+		return 0, ErrNoPeerConnection
+	}
+
 	stream, err := a.openStream(ctx, conn)
 	if err != nil {
 		return 0, err
 	}
 	defer stream.Close()
 
-	if err := writeDataHeader(stream, msgType); err != nil {
+	if err := writeDataHeader(stream, epoch, seq, msgType); err != nil {
 		return 0, fmt.Errorf("write header: %w", err)
 	}
 	if len(data) == 0 {
@@ -873,8 +964,10 @@ func (a *Alan) sendDataBytes(ctx context.Context, conn *quic.Conn, msgType strin
 	return int64(n), nil
 }
 
-// sendDataStream opens a stream, writes the data header, then copies body to
-// the stream. The body is read once.
+// sendDataStream opens a stream, writes the data header, then copies body
+// to the stream. The body is read once. Streaming Data carries
+// (epoch=0, seq=0) — stream handlers do not promise cross-message order
+// and bypass the receiver's reordering buffer entirely.
 func (a *Alan) sendDataStream(ctx context.Context, conn *quic.Conn, msgType string, body io.Reader) (int64, error) {
 	stream, err := a.openStream(ctx, conn)
 	if err != nil {
@@ -882,7 +975,7 @@ func (a *Alan) sendDataStream(ctx context.Context, conn *quic.Conn, msgType stri
 	}
 	defer stream.Close()
 
-	if err := writeDataHeader(stream, msgType); err != nil {
+	if err := writeDataHeader(stream, 0, 0, msgType); err != nil {
 		return 0, fmt.Errorf("write header: %w", err)
 	}
 
@@ -905,14 +998,20 @@ func (a *Alan) sendDataStream(ctx context.Context, conn *quic.Conn, msgType stri
 	return n, nil
 }
 
-// sendRequest opens a stream and writes a complete request frame.
-func (a *Alan) sendRequest(ctx context.Context, conn *quic.Conn, reqID []byte, msgType string, data []byte) error {
+// sendRequest opens a stream and writes a complete request frame, stamped
+// with the connection epoch and a per-peer monotonic sequence number so
+// the receiver dispatches the request handler in send order.
+func (a *Alan) sendRequest(ctx context.Context, addr *net.UDPAddr, conn *quic.Conn, reqID []byte, msgType string, data []byte) error {
+	epoch, seq, ok := a.peers.nextOutboundFrame(addr)
+	if !ok {
+		return ErrNoPeerConnection
+	}
 	stream, err := a.openStream(ctx, conn)
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
-	return writeRequestFrame(stream, reqID, msgType, data)
+	return writeRequestFrame(stream, epoch, seq, reqID, msgType, data)
 }
 
 // sendResponse opens a stream and writes a complete response frame.
@@ -925,14 +1024,48 @@ func (a *Alan) sendResponse(ctx context.Context, conn *quic.Conn, reqID []byte, 
 	return writeResponseFrame(stream, reqID, data)
 }
 
-// sendLockMsg opens a stream and writes a complete lock frame.
-func (a *Alan) sendLockMsg(ctx context.Context, conn *quic.Conn, msgType byte, reqID []byte, key string) error {
-	stream, err := a.openStream(ctx, conn)
-	if err != nil {
-		return err
-	}
-	defer stream.Close()
-	return writeLockFrame(stream, msgType, reqID, key)
+// sendLockMsg writes a single lock frame on the persistent per-peer
+// uni-directional lock-mux stream, opening it lazily on first use. All
+// lock frames to the same peer are serialised on this single stream,
+// which is the FIFO guarantee modelled in tla/LockSpecFIFO.tla.
+//
+// The conn argument is used only to open the stream on first call and
+// must match the connection currently registered for addr; passing a
+// stale conn returns ErrNoPeerConnection on the next attempt.
+func (a *Alan) sendLockMsg(ctx context.Context, addr *net.UDPAddr, conn *quic.Conn, msgType byte, reqID []byte, key string) error {
+	return a.peers.withLockSendStream(addr, func(peer *Peer) error {
+		if peer.lockSendStream == nil {
+			stream, err := conn.OpenStreamSync(ctx)
+			if err != nil {
+				peer.lockSendErr = fmt.Errorf("open lock-mux stream: %w", err)
+				return peer.lockSendErr
+			}
+			// Apply ctx deadline to the very first write only; subsequent
+			// frames manage their own deadlines.
+			if dl, ok := ctx.Deadline(); ok {
+				_ = stream.SetWriteDeadline(dl)
+			}
+			if err := writeMsgType(stream, MsgTypeLockMux); err != nil {
+				peer.lockSendErr = fmt.Errorf("write lock-mux selector: %w", err)
+				_ = stream.Close()
+				return peer.lockSendErr
+			}
+			_ = stream.SetWriteDeadline(time.Time{})
+			peer.lockSendStream = stream
+		}
+		if dl, ok := ctx.Deadline(); ok {
+			_ = peer.lockSendStream.SetWriteDeadline(dl)
+		}
+		err := writeLockFrame(peer.lockSendStream, msgType, reqID, key)
+		_ = peer.lockSendStream.SetWriteDeadline(time.Time{})
+		if err != nil {
+			peer.lockSendErr = fmt.Errorf("write lock frame: %w", err)
+			_ = peer.lockSendStream.Close()
+			peer.lockSendStream = nil
+			return peer.lockSendErr
+		}
+		return nil
+	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1010,11 +1143,13 @@ func (a *Alan) HasQuorum() bool {
 }
 
 // HasAllPeers returns true if all replicas are currently online.
+// Replicas counts the whole cluster including self; PeerCount excludes
+// self, so full membership is PeerCount() >= Replicas - 1.
 func (a *Alan) HasAllPeers() bool {
 	if a.config.Replicas == 0 {
 		return true
 	}
-	return a.PeerCount() >= a.config.Replicas
+	return a.PeerCount() >= a.config.Replicas-1
 }
 
 // WaitAll blocks until all replicas are online or ctx is cancelled.
@@ -1022,7 +1157,42 @@ func (a *Alan) WaitAll(ctx context.Context) error {
 	if a.config.Replicas == 0 {
 		return nil
 	}
-	return a.waitTicker(ctx, a.config.Replicas)
+	return a.waitTicker(ctx, a.config.Replicas-1)
+}
+
+// waitForFullMembership waits for all configured Replicas to be online,
+// bounded by Config.LockAcquireMembershipWait. The wait happens at most
+// ONCE per Alan instance — after the first call returns (whether
+// because full membership was reached, the timeout elapsed, or ctx was
+// cancelled), membershipSettled is set and subsequent calls return
+// immediately. This way the partial-visibility startup window is
+// closed by the first acquisition without imposing a per-call delay
+// on every Lock thereafter, including failover scenarios where a peer
+// has died and full membership will never be reached again.
+//
+// Returns early without setting membershipSettled if Replicas is 0
+// (standalone, no notion of full membership) or
+// LockAcquireMembershipWait is negative (the wait is disabled by
+// configuration).
+func (a *Alan) waitForFullMembership(ctx context.Context) {
+	if a.config.Replicas == 0 || a.config.LockAcquireMembershipWait < 0 {
+		return
+	}
+	if a.membershipSettled.Load() {
+		return
+	}
+	if a.HasAllPeers() {
+		a.membershipSettled.Store(true)
+		return
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, a.config.LockAcquireMembershipWait)
+	defer cancel()
+	_ = a.WaitAll(waitCtx)
+	// Settled regardless of WaitAll outcome: either we reached full
+	// membership, or we waited long enough that the cluster's current
+	// shape is the working assumption. Subsequent acquisitions go
+	// straight through.
+	a.membershipSettled.Store(true)
 }
 
 // WaitForQuorum blocks until quorum is reached or ctx is cancelled.
@@ -1114,6 +1284,11 @@ func (a *Alan) handleConnection(conn *quic.Conn, addr *net.UDPAddr) {
 			a.removePeerQueue(addr)
 			a.enqueuePeerEvent(peerEventLeave, addr)
 		}
+		// peers.remove already deleted the entry, so closeLockSendStream
+		// can no longer find it; this is a no-op in the normal path.
+		// The QUIC connection close (in handleLeaveStream / Stop) tears
+		// down all streams it owned, so the persistent lock-mux stream
+		// is reclaimed without any explicit close here.
 	}()
 
 	for {
@@ -1150,8 +1325,8 @@ func (a *Alan) handleStream(stream *quic.Stream, addr *net.UDPAddr) {
 		a.handleRequestStream(stream, addr)
 	case MsgTypeResponse:
 		a.handleResponseStream(stream, addr)
-	case MsgTypeLockRequest, MsgTypeLockGrant, MsgTypeLockDeny, MsgTypeLockRelease:
-		a.handleLockStream(msgType, stream, addr)
+	case MsgTypeLockMux:
+		a.handleLockMuxStream(stream, addr)
 	case MsgTypeLeave:
 		a.handleLeaveStream(addr)
 	default:
@@ -1189,7 +1364,7 @@ func (a *Alan) handleLeaveStream(addr *net.UDPAddr) {
 }
 
 func (a *Alan) handleDataStream(stream *quic.Stream, addr *net.UDPAddr) {
-	msgType, err := readDataHeader(stream)
+	epoch, seq, msgType, err := readDataHeader(stream)
 	if err != nil {
 		return
 	}
@@ -1212,7 +1387,8 @@ func (a *Alan) handleDataStream(stream *quic.Stream, addr *net.UDPAddr) {
 	}
 
 	if hasStream {
-		// Stream handler: deliver remaining stream as io.Reader.
+		// Stream handler: deliver remaining stream as io.Reader. Seq is
+		// ignored — stream handlers do not promise cross-message order.
 		_ = streamHandler(a.ctx, msg, stream)
 		return
 	}
@@ -1231,11 +1407,11 @@ func (a *Alan) handleDataStream(stream *quic.Stream, addr *net.UDPAddr) {
 	}
 	msg.Data = body
 	msg.Size = int64(len(body))
-	a.enqueueMessage(addr, msg, byteHandler)
+	a.enqueueMessage(addr, epoch, seq, msg, byteHandler)
 }
 
 func (a *Alan) handleRequestStream(stream *quic.Stream, addr *net.UDPAddr) {
-	reqID, msgType, body, err := readRequestFrame(stream, a.config.MaxMessageSize)
+	epoch, seq, reqID, msgType, body, err := readRequestFrame(stream, a.config.MaxMessageSize)
 	if err != nil {
 		return
 	}
@@ -1259,7 +1435,7 @@ func (a *Alan) handleRequestStream(stream *quic.Stream, addr *net.UDPAddr) {
 		Size:      int64(len(body)),
 		requestID: reqID,
 	}
-	a.enqueueMessage(addr, msg, byteHandler)
+	a.enqueueMessage(addr, epoch, seq, msg, byteHandler)
 }
 
 func (a *Alan) handleResponseStream(stream *quic.Stream, addr *net.UDPAddr) {
@@ -1280,11 +1456,12 @@ func (a *Alan) handleResponseStream(stream *quic.Stream, addr *net.UDPAddr) {
 	}
 }
 
-func (a *Alan) handleLockStream(msgType byte, stream *quic.Stream, addr *net.UDPAddr) {
-	reqID, key, err := readLockFrame(stream)
-	if err != nil {
-		return
-	}
+// dispatchLockFrame routes a single decoded lock frame to its handler.
+// The caller (handleLockMuxStream) reads frames serially from the
+// per-peer lock-mux stream so dispatches are FIFO with respect to the
+// sender, which is the ordering guarantee the lock state machine
+// depends on.
+func (a *Alan) dispatchLockFrame(msgType byte, reqID []byte, key string, addr *net.UDPAddr) {
 	switch msgType {
 	case MsgTypeLockRequest:
 		a.handleLockRequest(reqID, key, addr)
@@ -1293,7 +1470,31 @@ func (a *Alan) handleLockStream(msgType byte, stream *quic.Stream, addr *net.UDP
 	case MsgTypeLockDeny:
 		a.handleLockDeny(reqID, key, addr)
 	case MsgTypeLockRelease:
-		a.handleLockRelease(key, addr)
+		a.handleLockRelease(reqID, key, addr)
+	}
+}
+
+// handleLockMuxStream reads framed lock messages from a long-lived
+// uni-directional stream serially and dispatches them in order. The
+// outer MsgTypeLockMux selector byte must already have been consumed
+// by handleStream.
+func (a *Alan) handleLockMuxStream(stream io.Reader, addr *net.UDPAddr) {
+	for {
+		msgType, err := readMsgType(stream)
+		if err != nil {
+			return
+		}
+		switch msgType {
+		case MsgTypeLockRequest, MsgTypeLockGrant, MsgTypeLockDeny, MsgTypeLockRelease:
+		default:
+			// Unknown frame on a lock-mux stream; abandon the stream.
+			return
+		}
+		reqID, key, err := readLockFrame(stream)
+		if err != nil {
+			return
+		}
+		a.dispatchLockFrame(msgType, reqID, key, addr)
 	}
 }
 
@@ -1346,6 +1547,8 @@ func (a *Alan) getOrCreatePeerQueue(addr *net.UDPAddr) *peerQueue {
 		ch:       make(chan queuedMessage, a.config.MessageQueueSize),
 		cancel:   cancel,
 		capBytes: a.config.MessageQueueBytes,
+		nextSeq:  1, // sender numbering is 1-based
+		pending:  make(map[uint64]queuedMessage),
 	}
 	pq.cond = sync.NewCond(&pq.mu)
 	a.peerQueues[key] = pq
@@ -1385,19 +1588,168 @@ func (a *Alan) closeAllPeerQueues() {
 	a.peerQueues = make(map[string]*peerQueue)
 }
 
-// enqueueMessage pushes a byte-handled message onto the per-peer queue,
-// applying byte-budget backpressure. The handler is captured into the queued
-// item so dispatch doesn't need another lookup.
-func (a *Alan) enqueueMessage(addr *net.UDPAddr, msg Message, handler MessageHandler) {
+// enqueueMessage delivers a byte-mode message to the per-peer ordered
+// queue in send order. (epoch, seq) identify the connection era and
+// per-frame monotonic sequence number; the dispatcher releases messages
+// to the worker channel in seq order, buffering out-of-order arrivals
+// in pq.pending until the gap closes.
+//
+// When epoch differs from pq.curEpoch, the sender has reconnected and
+// reset its seq counter. We discard pq.pending and reset nextSeq=1
+// before processing the new frame — this is the recovery path for the
+// reconnect race that motivated stamping epochs in the first place.
+//
+// seq=0 (and by convention epoch=0) is a sentinel meaning "skip
+// ordering" — such messages are passed straight through. The byte-budget
+// backpressure applies only to messages that actually reach the worker
+// channel; pending messages are not counted against the budget
+// (otherwise a hold-up of one in-order message would prevent every later
+// out-of-order arrival from even being parked, which is a deadlock).
+// Pending growth is bounded by MessageQueueSize as a count cap; if a
+// peer overshoots that cap the offending message is dropped.
+//
+// The handler argument is kept for symmetry with the dispatcher's
+// lookup path (the worker re-resolves so that a handler replaced
+// between enqueue and dispatch picks the latest registration).
+func (a *Alan) enqueueMessage(addr *net.UDPAddr, epoch, seq uint64, msg Message, handler MessageHandler) {
 	pq := a.getOrCreatePeerQueue(addr)
-	size := int64(len(msg.Data))
+	_ = handler
+	qm := queuedMessage{msg: msg, size: int64(len(msg.Data))}
 
-	// Wait for byte budget if needed.
+	// Unordered fast path: epoch=0 (and seq=0) is the wire sentinel
+	// for "bypass ordering" — used by SendStream and any synthetic
+	// deliveries that do not promise cross-message order. Real
+	// byte-mode sends always have epoch>=1, so seq=0 alone is NOT a
+	// sentinel: a wrapped seq counter legitimately produces seq=0 in
+	// the middle of a connection era and must go through the normal
+	// modular comparison path below.
+	if epoch == 0 {
+		a.deliverWithBudget(pq, qm)
+		return
+	}
+
+	// releaseMu serialises the "advance nextSeq + drain pending +
+	// write to ch" sequence. Without it, two concurrent enqueueMessage
+	// callers could pop messages off pending under mu, drop mu, and
+	// race on the channel — letting a higher-seq message overtake a
+	// lower-seq one.
+	pq.releaseMu.Lock()
+
+	pq.mu.Lock()
+	// Epoch transition handling. The sender bumps its epoch only on
+	// reconnect (fresh Peer record). Comparison is modular so a uint64
+	// wrap is well-defined.
+	//   - epoch "after" curEpoch: new era. Reset nextSeq=1, drop
+	//     pending, accept this frame. Also handles the bootstrap case
+	//     where curEpoch == 0 (no frame seen yet).
+	//   - epoch == curEpoch: normal modular seq comparison below.
+	//   - epoch "before" curEpoch: stale frame from a previous era
+	//     still in flight on a slower QUIC stream. Drop — the sender
+	//     already considers it past, and processing it would corrupt
+	//     nextSeq against the new era. Safe because byte-mode Send is
+	//     fire-and-forget; SendAndWaitReply callers see a reply
+	//     timeout if one was actually lost.
+	if epoch != 0 && epoch != pq.curEpoch {
+		if pq.curEpoch == 0 || seqAfter(epoch, pq.curEpoch) {
+			pq.curEpoch = epoch
+			pq.nextSeq = 1
+			for k := range pq.pending {
+				delete(pq.pending, k)
+			}
+		} else {
+			pq.mu.Unlock()
+			pq.releaseMu.Unlock()
+			return
+		}
+	}
+
+	// Modular seq comparison: tolerates the uint64 wrap.
+	if !seqAfter(seq, pq.nextSeq-1) {
+		// seq is at or before nextSeq-1, i.e. a duplicate / replay.
+		// QUIC gives at-most-once stream delivery so this shouldn't
+		// happen during steady-state, but the path defends against
+		// malformed senders.
+		pq.mu.Unlock()
+		pq.releaseMu.Unlock()
+		return
+	}
+	if seq != pq.nextSeq {
+		// Earlier seq numbers have not arrived yet. Park, bounded by
+		// the per-peer count cap. Drop releaseMu first so concurrent
+		// in-order callers are not blocked by the parking path.
+		pq.releaseMu.Unlock()
+		if len(pq.pending) >= a.config.MessageQueueSize {
+			// Pending is full. Dropping this message would create a
+			// permanent gap — the receiver would wait for a seq that
+			// can never arrive. Better to keep this message and drop
+			// the parked entry that is furthest from nextSeq (i.e.
+			// the worst offender, the one likeliest to never close).
+			// "Furthest" uses modular distance: (s - nextSeq) under
+			// uint64 subtraction; the largest such value is the seq
+			// that — if delivered — would force the longest pending
+			// chain. In practice this only triggers under extreme
+			// reorder; with a count cap of 256 and per-conn QUIC
+			// stream limits, normal traffic never reaches it.
+			var (
+				worstSeq  uint64
+				worstDist uint64
+			)
+			for s := range pq.pending {
+				d := s - pq.nextSeq // modular
+				if d > worstDist {
+					worstDist = d
+					worstSeq = s
+				}
+			}
+			incomingDist := seq - pq.nextSeq
+			if incomingDist < worstDist {
+				delete(pq.pending, worstSeq)
+				pq.pending[seq] = qm
+			}
+			// else: drop the incoming (it is the worst offender).
+			pq.mu.Unlock()
+			return
+		}
+		pq.pending[seq] = qm
+		pq.mu.Unlock()
+		return
+	}
+	// seq == pq.nextSeq: release this one, then drain any contiguous
+	// successors that have been parked. nextSeq increments are uint64
+	// adds and wrap naturally.
+	ready := []queuedMessage{qm}
+	pq.nextSeq++
+	for {
+		next, ok := pq.pending[pq.nextSeq]
+		if !ok {
+			break
+		}
+		delete(pq.pending, pq.nextSeq)
+		pq.nextSeq++
+		ready = append(ready, next)
+	}
+	pq.mu.Unlock()
+
+	// Deliver ready messages one at a time so the byte-budget /
+	// channel-capacity backpressure applies between handler invocations.
+	// releaseMu is still held, so any concurrent caller waiting on a
+	// later seq cannot publish to ch until we finish.
+	for _, m := range ready {
+		a.deliverWithBudget(pq, m)
+	}
+	pq.releaseMu.Unlock()
+}
+
+// deliverWithBudget reserves byte budget (waiting if necessary) and
+// pushes the message onto the worker channel. The budget is released
+// by the worker after the handler returns.
+func (a *Alan) deliverWithBudget(pq *peerQueue, qm queuedMessage) {
 	if pq.capBytes >= 0 {
 		pq.mu.Lock()
-		for pq.bytes+size > pq.capBytes && pq.capBytes >= 0 {
-			// Allow oversize messages to enqueue alone if the queue is empty,
-			// otherwise we'd deadlock when a single message is larger than the budget.
+		for pq.bytes+qm.size > pq.capBytes {
+			// Oversize-alone exception: when nothing else is buffered,
+			// admit a single message larger than the cap rather than
+			// deadlock.
 			if pq.bytes == 0 {
 				break
 			}
@@ -1409,22 +1761,16 @@ func (a *Alan) enqueueMessage(addr *net.UDPAddr, msg Message, handler MessageHan
 			}
 			pq.cond.Wait()
 		}
-		pq.bytes += size
+		pq.bytes += qm.size
 		pq.mu.Unlock()
 	}
 
-	// The handler argument is kept for symmetry with the dispatcher's lookup
-	// path (and to avoid races where a handler is replaced between enqueue
-	// and dispatch — re-resolution in the worker uses the latest registration).
-	_ = handler
-	qm := queuedMessage{msg: msg, size: size}
 	select {
 	case pq.ch <- qm:
 	case <-a.ctx.Done():
-		// Queue going down — release the byte budget we reserved.
 		if pq.capBytes >= 0 {
 			pq.mu.Lock()
-			pq.bytes -= size
+			pq.bytes -= qm.size
 			pq.cond.Broadcast()
 			pq.mu.Unlock()
 		}
