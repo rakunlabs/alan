@@ -295,10 +295,18 @@ consistency.
 
 - During network partitions, multiple peers may believe they hold the lock.
 - No fencing tokens — there's no way to prove ownership to an external system.
-- Startup race: peers starting simultaneously may all acquire the lock
-  before discovering each other. Configure `Replicas` so quorum mitigates
-  this, and see [Avoiding the Startup Race in Kubernetes](#avoiding-the-startup-race-in-kubernetes)
-  for the operational pattern that closes the gap.
+- Startup race: peers starting simultaneously could in principle all
+  acquire the lock before discovering each other. The
+  `LockAcquireMembershipWait` warm-start guard (see "Lock acquisition:
+  warm-start guard" above) closes this window in code by holding the
+  first `Lock` call until either the full peer set is online or the
+  bounded wait elapses. With the default 5 s wait and `Replicas` set
+  correctly, the operational mitigations described in
+  [Avoiding the Startup Race in Kubernetes](#avoiding-the-startup-race-in-kubernetes)
+  are no longer required for correctness — they remain a useful
+  defence-in-depth layer for environments where DNS resolution alone
+  can take longer than the wait, or where `LockAcquireMembershipWait`
+  has been set to a negative value to disable the guard.
 
 ### Leader Election Helpers
 
@@ -801,9 +809,31 @@ under heavy load.
 
 Alan's locks rely on peer discovery to serialize acquisitions. If N pods
 boot at the same instant — before they discover each other via DNS —
-each may self-grant the same lock. The fix is operational: bring pods up
-one at a time so each new pod discovers existing peers before its first
-`Lock` call.
+each could in principle self-grant the same lock.
+
+The library closes this window itself with the warm-start guard
+described in [Lock acquisition: warm-start guard](#lock-acquisition-warm-start-guard):
+the first `Lock` call after `Start` waits up to
+`LockAcquireMembershipWait` (default 5 s) for the full configured peer
+set before deciding to acquire. As long as DNS + handshake completes
+within that window — typically far under one second — every concurrent
+boot serialises through the wait and the existing tie-break code
+elects exactly one holder.
+
+So the orchestration patterns below are **no longer required** for
+correctness with default settings. They remain useful as
+defence-in-depth in three situations:
+
+1. DNS resolution may legitimately take longer than
+   `LockAcquireMembershipWait` (cold-DNS, slow service mesh).
+2. You have set `LockAcquireMembershipWait` to a negative value to
+   disable the guard.
+3. You want to be certain about start-up sequencing for reasons that
+   go beyond locking (e.g. dependency ordering, gradual ramp-up).
+
+The original pattern — bring pods up one at a time so each new pod
+discovers existing peers before its first `Lock` call — is shown
+below.
 
 Use a `Deployment` with a single-pod rolling update:
 
